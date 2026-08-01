@@ -4,6 +4,7 @@ test_invariants.py — small, dependency-free checks of the load-bearing guarant
 Run:  python test_invariants.py
 """
 
+import asyncio
 import json
 import random
 import threading
@@ -546,6 +547,124 @@ def test_eval_runs_mock_registry_offline():
     tr = results["mock"]["m"]
     assert tr.success and tr.reason == "goal_satisfied", (tr.success, tr.reason)
     assert tr.cost_usd == 0.0, tr.cost_usd
+
+
+def test_async_executor_runs_and_replays():
+    """An `async def run` executor works at the seam: the scheduler awaits it via
+    asyncio.gather, records its awaited step via ctx.record_async, and the run replays
+    identically. (Phase 2 — literal asyncio, not a thread pool.)"""
+    class _AsyncScout(Executor):
+        async def run(self, inputs, params, ctx):
+            async def fetch():
+                await asyncio.sleep(0)                 # a real async model/IO call
+                return {"subtopic": params["subtopic"], "facts": []}
+            mat = await ctx.record_async("fetch", fetch)
+            return ExecutionResult(output=mat, signal=Signal.CONTINUE)
+
+    reg = default_registry()
+    reg[NodeType.SCOUT] = _AsyncScout()
+    store = SQLiteEventStore(":memory:")
+    r = Scheduler(store, reg, budget=Budget()).run(dict(GOAL))
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    scout = next(rec for nid, rec in r.graph.nodes.items() if nid.startswith("scout"))
+    assert "fetch" in r.graph.activities.get(scout.node_id, {}), "async activity not recorded"
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok, "replay diverged with an async executor"
+
+
+def test_async_batch_runs_concurrently():
+    """Under max_workers>1 the async batch truly interleaves via asyncio.gather: three
+    async scouts are all in-flight at once — a serialized loop (or semaphore=1) could
+    not produce that. Single-threaded, so the shared counter needs no lock."""
+    state = {"live": 0, "peak": 0}
+
+    class _AsyncScout(Executor):
+        async def run(self, inputs, params, ctx):
+            state["live"] += 1
+            state["peak"] = max(state["peak"], state["live"])
+            await asyncio.sleep(0.02)
+            state["live"] -= 1
+            return ExecutionResult(output={"subtopic": params["subtopic"], "facts": []},
+                                   signal=Signal.CONTINUE)
+
+    reg = default_registry()
+    reg[NodeType.SCOUT] = _AsyncScout()
+    store = SQLiteEventStore(":memory:")
+    goal = {"topic": "t", "subtopics": ["a", "b", "c"], "target_score": 0.80}
+    r = Scheduler(store, reg, budget=Budget(), max_workers=3).run(goal)
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    assert state["peak"] >= 2, f"async batch did not overlap (peak in-flight={state['peak']})"
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
+
+
+def test_workers_produce_same_result_as_batch():
+    """Distributed-worker execution (workers PULL the frontier; single-writer commit)
+    produces the SAME result as the batch scheduler — identical structure, terminal
+    output, and termination — and the log still replays. Only the event interleaving
+    differs, and structural_hash is state-based, so results match (Phase 2)."""
+    batch = Scheduler(SQLiteEventStore(":memory:"), default_registry(),
+                      budget=Budget()).run(dict(GOAL))
+    wstore = SQLiteEventStore(":memory:")
+    workers = Scheduler(wstore, default_registry(),
+                        budget=Budget()).run_workers(dict(GOAL), n_workers=4)
+    assert workers.reason == batch.reason == TerminationReason.GOAL_SATISFIED
+    assert workers.terminal_output == batch.terminal_output, "worker result differs from batch"
+    assert workers.graph.structural_hash() == batch.graph.structural_hash(), "structure differs"
+    ok, _, _ = verify_replay(wstore, workers.graph, workers.run_id)
+    assert ok, "worker-mode log did not replay"
+
+
+def test_workers_pull_frontier_concurrently():
+    """N workers pull the frontier and execute concurrently: three async scouts are all
+    in-flight at once under n_workers=3 — the pull model's real parallelism."""
+    state = {"live": 0, "peak": 0}
+
+    class _AsyncScout(Executor):
+        async def run(self, inputs, params, ctx):
+            state["live"] += 1
+            state["peak"] = max(state["peak"], state["live"])
+            await asyncio.sleep(0.02)
+            state["live"] -= 1
+            return ExecutionResult(output={"subtopic": params["subtopic"], "facts": []},
+                                   signal=Signal.CONTINUE)
+
+    reg = default_registry()
+    reg[NodeType.SCOUT] = _AsyncScout()
+    store = SQLiteEventStore(":memory:")
+    goal = {"topic": "t", "subtopics": ["a", "b", "c"], "target_score": 0.80}
+    r = Scheduler(store, reg, budget=Budget()).run_workers(goal, n_workers=3)
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    assert state["peak"] >= 2, f"workers did not overlap (peak in-flight={state['peak']})"
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
+
+
+def test_backpressure_bounds_in_flight():
+    """Backpressure: with max_inflight below the worker count, no more than max_inflight
+    nodes are admitted-and-running at once — even with 8 ready scouts and 8 idle workers.
+    The coordinator paces admission to commit instead of flooding the queue."""
+    state = {"live": 0, "peak": 0}
+
+    class _AsyncScout(Executor):
+        async def run(self, inputs, params, ctx):
+            state["live"] += 1
+            state["peak"] = max(state["peak"], state["live"])
+            await asyncio.sleep(0.02)
+            state["live"] -= 1
+            return ExecutionResult(output={"subtopic": params["subtopic"], "facts": []},
+                                   signal=Signal.CONTINUE)
+
+    reg = default_registry()
+    reg[NodeType.SCOUT] = _AsyncScout()
+    store = SQLiteEventStore(":memory:")
+    goal = {"topic": "t", "subtopics": [f"s{i}" for i in range(8)], "target_score": 0.80}
+    r = Scheduler(store, reg, budget=Budget()).run_workers(goal, n_workers=8, max_inflight=3)
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    assert state["peak"] <= 3, f"backpressure exceeded: peak in-flight={state['peak']} > 3"
+    assert state["peak"] >= 2, f"no concurrency under the cap (peak={state['peak']})"
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
 
 
 def main():

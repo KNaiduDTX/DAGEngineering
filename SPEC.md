@@ -408,6 +408,8 @@ Module: `governor.CostGovernor`, `scheduler.run`.
 | INV-6.1 acyclic at every prefix | `demo.py` GUARD 1 rejects the back-edge |
 | INV-7.1 four termination reasons | `demo.py` (goal) + `test_budget_terminates_runaway` (cap) + `test_cost_cap_enforced_within_a_wide_tick` (mid-tick budget) |
 | execute/commit ordering deterministic (§5.4, §9) | `test_batch_commit_ordering_is_deterministic`; `test_concurrent_execute_matches_serial` + `test_batch_executes_concurrently` (real parallelism, same result) |
+| async executors → literal asyncio.gather (§9) | `test_async_executor_runs_and_replays`; `test_async_batch_runs_concurrently` |
+| distributed workers ≡ batch; backpressure bounds in-flight (§9) | `test_workers_produce_same_result_as_batch`; `test_workers_pull_frontier_concurrently`; `test_backpressure_bounds_in_flight` |
 | recorded activity replayed / exactly-once (§5.2) | `test_recorded_activity_is_replayed_on_retry` |
 | real token→$ cost recorded (§5.3) | `test_real_cost_recorded_from_usage`; `test_openrouter_executors_run_and_record_provider_cost` (per-model provider cost) |
 | retryable/terminal taxonomy; refusal not retried (§9) | `test_terminal_error_is_not_retried`; `test_openrouter_refusal_is_terminal` |
@@ -425,12 +427,23 @@ What changes, and nothing else does:
 
 * **Batch → concurrency.** *Done.* The loop separates a pure **execute** phase from
   the serial **admit**/**commit** phases (§5.4); `Scheduler(max_workers=N)` runs the
-  admitted batch's `_execute` concurrently in a thread pool (correct for sync,
-  I/O-bound executors — the GIL releases during model/network calls), capped at
-  `max_workers` (the real WIP limit). Results commit in admitted order, so the run is
-  deterministic under concurrency (`test_concurrent_execute_matches_serial`). Once
-  executors are `async def`, the pool becomes a literal `asyncio.gather`. The store's
-  `seq` remains the single serialization point.
+  admitted batch concurrently, capped at `max_workers` (the real WIP limit), with
+  results committed in admitted order so the run stays deterministic
+  (`test_concurrent_execute_matches_serial`). Two execute paths: sync executors run in
+  a thread pool (GIL releases during I/O); an **`async def` executor triggers a literal
+  `asyncio.gather`** over the batch (semaphore = WIP cap; `ctx.record_async` for awaited
+  steps) — `test_async_batch_runs_concurrently`. The store's `seq` remains the single
+  serialization point.
+* **Distributed workers + backpressure.** *Done (in-process reference).*
+  `Scheduler.run_workers(n_workers, max_inflight)` inverts the loop to a **pull** model:
+  workers pull ready nodes from a shared frontier queue and execute the pure phase
+  concurrently, while a **single-writer coordinator** does all admit + commit — so the
+  event log stays single-writer even across the worker boundary. It produces the *same
+  result* as `run()` (`test_workers_produce_same_result_as_batch`). `max_inflight` is
+  **backpressure** — the coordinator admits at most that many nodes ahead of commit, so
+  it never over-charges cost or floods the queue (`test_backpressure_bounds_in_flight`).
+  The asyncio implementation is the reference shape for real remote workers pulling from
+  a durable queue (Redis/SQS) and posting outcomes back.
 * **SQLite → Postgres**, in-memory projection → **Neo4j** fold. Same events, same
   guards (they sit at the store boundary).
 * **Deterministic executors → real models** at the single `Executor.run` seam.

@@ -78,6 +78,14 @@ class Context:
             return fn()
         return self.activities.record(key, fn)
 
+    async def record_async(self, key: str, fn):
+        """Async twin of record() for `async def run` executors: `await fn()` (a
+        coroutine) at most once per node, replayed thereafter. Same exactly-once
+        guarantee; wrap every awaited model/tool/IO call in it."""
+        if self.activities is None:
+            return await fn()
+        return await self.activities.record_async(key, fn)
+
 
 class Executor(ABC):
     @abstractmethod
