@@ -5,6 +5,7 @@ Run:  python test_invariants.py
 """
 
 import random
+import threading
 
 from dyndag import (Budget, ExecutionResult, Executor, GraphProjection, NodeSpec,
                     NodeType, Provenance, Scheduler, Signal, SQLiteEventStore,
@@ -303,6 +304,41 @@ def test_real_cost_recorded_from_usage():
     assert ok, "replay diverged with cost recorded"
     rep = cost_report(r.graph)
     assert "1000 in" in rep and "500 out" in rep, rep
+
+
+def test_concurrent_execute_matches_serial():
+    """max_workers>1 parallelizes the pure execute phase WITHOUT changing semantics:
+    identical structure, terminal output, and termination vs serial. Commit stays serial
+    and in admitted order, so the run is deterministic under concurrency (Phase 2)."""
+    serial = Scheduler(SQLiteEventStore(":memory:"), default_registry(),
+                       budget=Budget(), max_workers=1).run(dict(GOAL))
+    conc = Scheduler(SQLiteEventStore(":memory:"), default_registry(),
+                     budget=Budget(), max_workers=4).run(dict(GOAL))
+    assert serial.graph.structural_hash() == conc.graph.structural_hash(), "structure differs"
+    assert serial.terminal_output == conc.terminal_output, "terminal output differs"
+    assert serial.reason == conc.reason == TerminationReason.GOAL_SATISFIED
+
+
+def test_batch_executes_concurrently():
+    """The admitted batch runs in parallel under max_workers: three scouts each waiting
+    on a shared 3-party barrier all clear it — only possible if they execute
+    concurrently (a serial run would block one scout on the barrier forever)."""
+    barrier = threading.Barrier(3, timeout=15)
+
+    class _BarrierScout(Executor):
+        def run(self, inputs, params, ctx):
+            barrier.wait()   # releases only when all three scouts are in-flight together
+            return ExecutionResult(output={"subtopic": params["subtopic"], "facts": []},
+                                   signal=Signal.CONTINUE)
+
+    reg = default_registry()
+    reg[NodeType.SCOUT] = _BarrierScout()
+    store = SQLiteEventStore(":memory:")
+    goal = {"topic": "t", "subtopics": ["a", "b", "c"], "target_score": 0.80}
+    r = Scheduler(store, reg, budget=Budget(), max_workers=3).run(goal)
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok, "replay diverged under concurrent execution"
 
 
 def main():

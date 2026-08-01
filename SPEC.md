@@ -407,7 +407,9 @@ Module: `governor.CostGovernor`, `scheduler.run`.
 | INV-4.1 typed completion signal | `Signal` enum; scheduler branches on `result.signal` only |
 | INV-6.1 acyclic at every prefix | `demo.py` GUARD 1 rejects the back-edge |
 | INV-7.1 four termination reasons | `demo.py` (goal) + `test_budget_terminates_runaway` (cap) + `test_cost_cap_enforced_within_a_wide_tick` (mid-tick budget) |
-| execute/commit ordering deterministic (§5.4, §9) | `test_batch_commit_ordering_is_deterministic` |
+| execute/commit ordering deterministic (§5.4, §9) | `test_batch_commit_ordering_is_deterministic`; `test_concurrent_execute_matches_serial` + `test_batch_executes_concurrently` (real parallelism, same result) |
+| recorded activity replayed / exactly-once (§5.2) | `test_recorded_activity_is_replayed_on_retry` |
+| real token→$ cost recorded (§5.3) | `test_real_cost_recorded_from_usage` |
 | SSA write-once | `test_single_assignment_write_once` |
 
 Run `python demo.py` and `python test_invariants.py`; both assert these.
@@ -418,11 +420,14 @@ Run `python demo.py` and `python test_invariants.py`; both assert these.
 
 What changes, and nothing else does:
 
-* **Batch → concurrency.** The loop already separates a pure **execute** phase
-  from the serial **admit**/**commit** phases (§5.4), so concurrency is: replace
-  `outcomes = [execute(n) for n in admitted]` with `asyncio.gather`. The ready
-  set is the concurrency unit; ordering within it is semantically irrelevant, and
-  the store's `seq` remains the single serialization point.
+* **Batch → concurrency.** *Done.* The loop separates a pure **execute** phase from
+  the serial **admit**/**commit** phases (§5.4); `Scheduler(max_workers=N)` runs the
+  admitted batch's `_execute` concurrently in a thread pool (correct for sync,
+  I/O-bound executors — the GIL releases during model/network calls), capped at
+  `max_workers` (the real WIP limit). Results commit in admitted order, so the run is
+  deterministic under concurrency (`test_concurrent_execute_matches_serial`). Once
+  executors are `async def`, the pool becomes a literal `asyncio.gather`. The store's
+  `seq` remains the single serialization point.
 * **SQLite → Postgres**, in-memory projection → **Neo4j** fold. Same events, same
   guards (they sit at the store boundary).
 * **Deterministic executors → real models** at the single `Executor.run` seam.

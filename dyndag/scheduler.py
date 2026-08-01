@@ -70,6 +70,7 @@ class Scheduler:
         budget: Optional[Budget] = None,
         constraint_filter: Optional[ConstraintFilter] = None,
         beam_width: int = 0,                      # 0 => no beam pruning
+        max_workers: int = 1,                     # 1 => serial execute; >1 => real WIP cap
     ):
         self.store = store
         self.registry = registry
@@ -77,6 +78,7 @@ class Scheduler:
         self.governor = CostGovernor(budget or Budget())
         self.filter = constraint_filter or ConstraintFilter()
         self.beam_width = beam_width
+        self.max_workers = max(1, int(max_workers))
         self.graph = GraphProjection()
 
     # --------------------------------------------------------------------- #
@@ -218,6 +220,20 @@ class Scheduler:
             return _Outcome(node_id=node_id, error=exc, activities=recorder.recorded)
         return _Outcome(node_id=node_id, result=result, activities=recorder.recorded)
 
+    def _execute_batch(self, run_id: str, admitted: list, goal: dict) -> list:
+        """Execute the admitted batch (Phase 2 concurrency). Serial by default; with
+        max_workers>1 the pure execute phase runs concurrently in a thread pool —
+        correct for sync, I/O-bound executors (the GIL releases during model/network
+        calls), capped at max_workers (the real WIP limit). Results are returned in
+        ADMITTED order so commit stays serial and the run stays deterministic. Once
+        executors are `async def`, this becomes a literal `asyncio.gather`. Executors
+        must be stateless/thread-safe for concurrent execution."""
+        if self.max_workers <= 1 or len(admitted) <= 1:
+            return [self._execute(run_id, node_id, goal) for node_id in admitted]
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+            return list(pool.map(lambda node_id: self._execute(run_id, node_id, goal), admitted))
+
     def _commit(self, run_id: str, outcome: _Outcome, predicate) -> Optional[dict]:
         """Serial, single-writer: fold one execution outcome into the log and graph.
         A failure becomes NODE_FAILED (+ retry/reopen); a success becomes
@@ -356,9 +372,9 @@ class Scheduler:
                 self._admit(run_id, node_id)
                 admitted.append(node_id)
 
-            # EXECUTE (pure). This is the seam Phase 2 runs under asyncio.gather;
-            # serially for now, but nothing else in the loop needs to change (D).
-            outcomes = [self._execute(run_id, node_id, goal) for node_id in admitted]
+            # EXECUTE (pure). Serial by default; concurrent under max_workers (the WIP
+            # cap) — only this phase parallelizes, admit/commit stay serial (D).
+            outcomes = self._execute_batch(run_id, admitted, goal)
 
             # COMMIT (serial, single-writer, deterministic order). A satisfied goal
             # takes precedence over a cost bound tripped during admission.
