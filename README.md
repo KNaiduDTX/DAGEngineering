@@ -59,11 +59,13 @@ Wrap each model/tool/IO call as a *recorded activity* (`ctx.record(key, fn)`, st
 as an `ACTIVITY_RECORDED` event) so replay/retry never re-runs it — see `SPEC.md`
 §5.2 and §9.
 
-A worked example ships in `executors_ollama.py`: a real local-model ENGINEER (Ollama)
-with structured output and a validate/repair loop, everything else still mock. Run it
-with `python demo_ollama.py` (needs `pip install ollama` + a pulled model); it prints a
-skip notice if Ollama isn't reachable. The offline `demo.py` / `test_invariants.py`
-never require it.
+A worked example ships in `executors_ollama.py`: a real local-model ENGINEER **and**
+REVIEWER (Ollama) with structured output and a validate/repair loop; GOAL/SCOUT/
+SYNTHESIZER stay mock. With a real critic the score is a genuine model judgment and the
+loop converges for real (or terminates on the generation cap). Run it with
+`python demo_ollama.py` (needs `pip install ollama` + a pulled model); it prints a skip
+notice if Ollama isn't reachable. The offline `demo.py` / `test_invariants.py` never
+require it.
 
 ## Design commitments (from the approved decisions)
 

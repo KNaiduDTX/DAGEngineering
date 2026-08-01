@@ -6,9 +6,9 @@ Run:  python test_invariants.py
 
 import random
 
-from dyndag import (Budget, ExecutionResult, Executor, GraphProjection, NodeType,
-                    Provenance, Scheduler, Signal, SQLiteEventStore, SubgraphPatch,
-                    TerminationReason, default_registry, verify_replay)
+from dyndag import (Budget, ExecutionResult, Executor, GraphProjection, NodeSpec,
+                    NodeType, Provenance, Scheduler, Signal, SQLiteEventStore,
+                    SubgraphPatch, TerminationReason, default_registry, verify_replay)
 from dyndag.core import Event, EventType, now_iso
 from dyndag.graph import SingleAssignmentError
 from dyndag.steering import beam_prune
@@ -243,6 +243,33 @@ def test_recorded_activity_is_replayed_on_retry():
     assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
     ok, live_h, rep_h = verify_replay(store, r.graph, r.run_id)
     assert ok, f"replay diverged with recorded activities present: {live_h} vs {rep_h}"
+
+
+def test_synthesizer_uses_reviewer_score_not_draft_selfreport():
+    """The terminal score is the REVIEWER's independent judgment, not the draft's
+    self-reported quality — the decoupling that lets a real critic drive the loop.
+    An approving reviewer scores 0.95 over a revision-0 draft (self-report 0.60);
+    the brief must carry 0.95."""
+    class _ApprovingReviewer(Executor):
+        def run(self, inputs, params, ctx):
+            draft_id = next(k for k, v in inputs.items()
+                            if isinstance(v, dict) and v.get("kind") == "draft")
+            synth = NodeSpec(key="synthesizer", node_type=NodeType.SYNTHESIZER,
+                             input_keys=(draft_id, ctx.self_id),
+                             params={"subtopics": params["subtopics"],
+                                     "target_score": params["target_score"]})
+            return ExecutionResult(output={"verdict": "approve", "score": 0.95},
+                                   signal=Signal.DONE, score=0.95,
+                                   patch=SubgraphPatch(added_nodes=[synth]))
+
+    reg = default_registry()
+    reg[NodeType.REVIEWER] = _ApprovingReviewer()
+    store = SQLiteEventStore(":memory:")
+    r = Scheduler(store, reg, budget=Budget()).run(dict(ONE))
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    assert r.terminal_output["final_score"] == 0.95, r.terminal_output["final_score"]
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
 
 
 def main():

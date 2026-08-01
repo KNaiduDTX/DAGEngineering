@@ -11,7 +11,8 @@ from .nodes import NodeSpec, SubgraphPatch
 from .activities import ActivityRecorder
 from .executors import (Executor, ExecutionResult, Context, ModelRouter,
                         MalformedResultError, default_registry)
-from .executors_ollama import OllamaEngineerExecutor, ollama_registry
+from .executors_ollama import (OllamaEngineerExecutor, OllamaReviewerExecutor,
+                               ollama_registry)
 from .steering import CoverageGoal, ConstraintFilter
 from .governor import Budget, CostGovernor
 from .scheduler import Scheduler, RunResult
@@ -20,7 +21,7 @@ from .views import render_blackboard, verify_replay, lineage_report, provenance_
 __all__ = [
     "Scheduler", "RunResult", "SQLiteEventStore", "EventStore", "GraphProjection",
     "NodeSpec", "SubgraphPatch", "Executor", "ExecutionResult", "Context",
-    "ActivityRecorder", "OllamaEngineerExecutor", "ollama_registry",
+    "ActivityRecorder", "OllamaEngineerExecutor", "OllamaReviewerExecutor", "ollama_registry",
     "ModelRouter", "MalformedResultError", "default_registry", "CoverageGoal", "ConstraintFilter",
     "Budget", "CostGovernor", "NodeType", "NodeState", "Signal", "Tier",
     "TerminationReason", "Provenance", "Event", "EventType",

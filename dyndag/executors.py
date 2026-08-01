@@ -261,19 +261,25 @@ class ReviewerExecutor(Executor):
 
 
 class SynthesizerExecutor(Executor):
-    """Aggregator. Merges the approved draft into the terminal brief and raises
-    the GOAL signal; the scheduler then checks the goal predicate before
-    accepting termination."""
+    """Aggregator. Merges the approved draft into the terminal brief and raises the
+    GOAL signal; the scheduler then checks the goal predicate before accepting
+    termination. The terminal score is the REVIEWER's independent judgment (read from
+    the approval among its inputs), falling back to the draft's self-report for the
+    all-mock path — so a real critic drives the score without changing this node."""
     def run(self, inputs, params, ctx) -> ExecutionResult:
         draft = next(v for v in inputs.values() if isinstance(v, dict) and v.get("kind") == "draft")
+        approval = next((v for v in inputs.values()
+                         if isinstance(v, dict) and v.get("verdict") == "approve" and "score" in v),
+                        None)
+        final_score = approval["score"] if approval else draft.get("quality")
         brief = {
             "kind": "brief",
             "topic": draft["topic"],
             "covered": draft["covered"],
-            "final_score": draft["quality"],
-            "sections": {st: f"section on {st}" for st in draft["covered"]},
+            "final_score": final_score,
+            "sections": draft.get("sections") or {st: f"section on {st}" for st in draft["covered"]},
         }
-        return ExecutionResult(output=brief, signal=Signal.GOAL, score=draft["quality"])
+        return ExecutionResult(output=brief, signal=Signal.GOAL, score=final_score)
 
 
 def default_registry() -> dict[NodeType, Executor]:
