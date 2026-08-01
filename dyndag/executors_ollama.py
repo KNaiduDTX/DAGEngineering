@@ -29,7 +29,8 @@ Ollama. Run the live slice with `python demo_ollama.py`.
 from __future__ import annotations
 
 import json
-from typing import Optional
+import re
+from typing import Callable, Optional
 
 from .core import NodeType, Signal
 from .executors import (ExecutionResult, Executor, MalformedResultError,
@@ -209,10 +210,64 @@ class OllamaReviewerExecutor(Executor):
             patch=SubgraphPatch(added_nodes=[synth]))
 
 
-def ollama_registry(model: str = "llama3.2", **kwargs) -> dict:
-    """`default_registry()` with the ENGINEER and REVIEWER replaced by real Ollama-backed
-    ones; GOAL/SCOUT/SYNTHESIZER stay deterministic mocks. This is the Phase 1 slice."""
+def _overlap_rank(query: str, text: str) -> float:
+    """Deterministic lexical relevance (Jaccard over tokens) — real retrieval ranking
+    with no external service, so it runs offline. Swap for an embeddings ranker
+    (e.g. Ollama's embeddings endpoint) for semantic retrieval."""
+    q = set(re.findall(r"[a-z0-9]+", query.lower()))
+    d = set(re.findall(r"[a-z0-9]+", text.lower()))
+    if not q or not d:
+        return 0.0
+    return len(q & d) / len(q | d)
+
+
+class RetrievalScoutExecutor(Executor):
+    """Frontier retrieval, for real: ranks a corpus (from `ctx.goal['corpus']`) by
+    relevance to this scout's subtopic and returns the top hits as facts. The ranking
+    is pluggable — the default is deterministic lexical overlap (offline); pass an
+    embeddings-backed `ranker` for semantic search. The retrieval is a recorded
+    activity, so a retry/recovery replays the exact hits (and, with a real ranker,
+    doesn't re-embed)."""
+
+    def __init__(self, top_k: int = 3, ranker: Optional[Callable[[str, str], float]] = None):
+        self.top_k = top_k
+        self.ranker = ranker or _overlap_rank
+
+    def run(self, inputs, params, ctx) -> ExecutionResult:
+        subtopic = params["subtopic"]
+        topic = params.get("topic", "")
+        corpus = ctx.goal.get("corpus", []) if isinstance(ctx.goal, dict) else []
+        query = f"{topic} {subtopic}".strip()
+
+        def _retrieve() -> dict:
+            scored = []
+            for i, doc in enumerate(corpus):
+                text = doc["text"] if isinstance(doc, dict) else str(doc)
+                did = doc.get("id", f"doc{i}") if isinstance(doc, dict) else f"doc{i}"
+                scored.append((self.ranker(query, text), did, text))
+            scored.sort(key=lambda s: (-s[0], s[1]))
+            return {"hits": [{"id": did, "text": text}
+                             for score, did, text in scored[:self.top_k] if score > 0]}
+
+        result = ctx.record(f"retrieve_{subtopic}", _retrieve)
+        hits = result["hits"]
+        return ExecutionResult(
+            output={
+                "subtopic": subtopic,
+                "facts": [h["text"] for h in hits],
+                "sources": [h["id"] for h in hits],
+                "source": f"corpus://{topic}/{subtopic}",
+            },
+            signal=Signal.CONTINUE)
+
+
+def ollama_registry(model: str = "llama3.2", top_k: int = 3, **kwargs) -> dict:
+    """`default_registry()` with SCOUT (real retrieval), ENGINEER, and REVIEWER (real
+    Ollama) replaced; GOAL/SYNTHESIZER stay deterministic mocks. This is the Phase 1
+    real-executor fleet. The SCOUT reads its corpus from `goal['corpus']` and uses
+    offline lexical retrieval by default (no model)."""
     registry = default_registry()
+    registry[NodeType.SCOUT] = RetrievalScoutExecutor(top_k=top_k)
     registry[NodeType.ENGINEER] = OllamaEngineerExecutor(model=model, **kwargs)
     registry[NodeType.REVIEWER] = OllamaReviewerExecutor(model=model, **kwargs)
     return registry

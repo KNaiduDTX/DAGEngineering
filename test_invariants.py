@@ -341,6 +341,33 @@ def test_batch_executes_concurrently():
     assert ok, "replay diverged under concurrent execution"
 
 
+def test_retrieval_scout_ranks_corpus_and_records():
+    """A real retrieval SCOUT ranks a corpus by relevance to its subtopic (deterministic
+    lexical overlap), returns the top hits as facts, and records the retrieval as an
+    activity — offline, no model. The relevant doc is retrieved; the unrelated one isn't."""
+    from dyndag import RetrievalScoutExecutor
+
+    reg = default_registry()
+    reg[NodeType.SCOUT] = RetrievalScoutExecutor(top_k=2)
+    corpus = [
+        {"id": "d1", "text": "ingestion pipelines parse and load raw records"},
+        {"id": "d2", "text": "provenance tracks lineage and audit of every write"},
+        {"id": "d3", "text": "unrelated cooking recipes and gardening tips"},
+    ]
+    goal = {"topic": "data platform", "subtopics": ["ingestion"],
+            "target_score": 0.80, "corpus": corpus}
+    store = SQLiteEventStore(":memory:")
+    r = Scheduler(store, reg, budget=Budget()).run(goal)
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    scout = next(rec for nid, rec in r.graph.nodes.items() if nid.startswith("scout"))
+    assert "d1" in scout.output["sources"], scout.output["sources"]      # relevant, retrieved
+    assert "d3" not in scout.output["sources"], scout.output["sources"]  # irrelevant, not
+    assert any(k.startswith("retrieve_") for k in r.graph.activities.get(scout.node_id, {})), \
+        "retrieval was not recorded as an activity"
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
+
+
 def main():
     tests = [v for k, v in globals().items() if k.startswith("test_")]
     for t in tests:

@@ -52,6 +52,17 @@ def main() -> None:
         "topic": "stateless semantic enrichment",
         "subtopics": ["ingestion", "reasoning", "provenance"],
         "target_score": 0.80,
+        # the retrieval SCOUT ranks this corpus per subtopic (offline lexical ranking)
+        "corpus": [
+            {"id": "doc-ingestion", "text": "Ingestion streams parse raw records, "
+             "normalize schemas, and load them into the enrichment pipeline."},
+            {"id": "doc-reasoning", "text": "Reasoning applies inference rules over the "
+             "loaded records to derive new semantic facts and relationships."},
+            {"id": "doc-provenance", "text": "Provenance stamps every derived fact with "
+             "its lineage: run id, batch, and the upstream records it came from."},
+            {"id": "doc-noise", "text": "Unrelated: quarterly office snack budget and "
+             "the parking lot repaving schedule."},
+        ],
     }
 
     store = SQLiteEventStore(":memory:")

@@ -432,10 +432,12 @@ What changes, and nothing else does:
   guards (they sit at the store boundary).
 * **Deterministic executors → real models** at the single `Executor.run` seam.
   Wrap each model/tool/IO call as a recorded Activity so INV-5.1 still holds.
-  *Started:* `executors_ollama` provides a real local-model ENGINEER *and* REVIEWER
-  (Ollama; structured output + validate/repair; model calls recorded as activities),
-  with GOAL/SCOUT/SYNTHESIZER still mock. With the critic real, convergence is genuine
-  and bounded by the generation cap. Run it with `python demo_ollama.py`.
+  *Started:* `executors_ollama` provides a real retrieval SCOUT (ranks a corpus per
+  subtopic; offline lexical default, embeddings-ready) plus a real local-model ENGINEER
+  and REVIEWER (Ollama; structured output + validate/repair; every model call recorded
+  as an activity with real token→$ cost). GOAL/SYNTHESIZER stay mock. With the critic
+  real, convergence is genuine and bounded by the generation cap. Run it with
+  `python demo_ollama.py`.
 * **Idempotency keys** on external side-effecting Activities so replay/retry does
   not double-execute the world. *Done at the seam:* `Context.record(key, fn)` +
   `ACTIVITY_RECORDED` make each recorded step exactly-once across retries (§5.2).
@@ -459,7 +461,7 @@ What changes, and nothing else does:
 | `nodes.py` | §2.1, §2.3 (patch, placeholders) |
 | `activities.py` | §5.2 (recorded activities — replay/idempotency at the executor seam) |
 | `executors.py` | §3.1, §4.1–4.2, §5.3 (roles, critic loop, routing) |
-| `executors_ollama.py` | §3.1, §4.1, §5.2–5.3 (real Ollama ENGINEER + REVIEWER: structured output, critic loop, recorded activity) |
+| `executors_ollama.py` | §3.1, §4.1, §5.2–5.3 (real retrieval SCOUT + Ollama ENGINEER/REVIEWER: structured output, critic loop, recorded activity, token→$ cost) |
 | `steering.py` | §3.2–3.4 (predicate, filter, beam, value) |
 | `governor.py` | §7 (bounds, retry budget) |
 | `scheduler.py` | §2.2, §5.4 (the loop) |
