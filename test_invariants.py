@@ -4,6 +4,7 @@ test_invariants.py — small, dependency-free checks of the load-bearing guarant
 Run:  python test_invariants.py
 """
 
+import asyncio
 import json
 import random
 import threading
@@ -546,6 +547,55 @@ def test_eval_runs_mock_registry_offline():
     tr = results["mock"]["m"]
     assert tr.success and tr.reason == "goal_satisfied", (tr.success, tr.reason)
     assert tr.cost_usd == 0.0, tr.cost_usd
+
+
+def test_async_executor_runs_and_replays():
+    """An `async def run` executor works at the seam: the scheduler awaits it via
+    asyncio.gather, records its awaited step via ctx.record_async, and the run replays
+    identically. (Phase 2 — literal asyncio, not a thread pool.)"""
+    class _AsyncScout(Executor):
+        async def run(self, inputs, params, ctx):
+            async def fetch():
+                await asyncio.sleep(0)                 # a real async model/IO call
+                return {"subtopic": params["subtopic"], "facts": []}
+            mat = await ctx.record_async("fetch", fetch)
+            return ExecutionResult(output=mat, signal=Signal.CONTINUE)
+
+    reg = default_registry()
+    reg[NodeType.SCOUT] = _AsyncScout()
+    store = SQLiteEventStore(":memory:")
+    r = Scheduler(store, reg, budget=Budget()).run(dict(GOAL))
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    scout = next(rec for nid, rec in r.graph.nodes.items() if nid.startswith("scout"))
+    assert "fetch" in r.graph.activities.get(scout.node_id, {}), "async activity not recorded"
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok, "replay diverged with an async executor"
+
+
+def test_async_batch_runs_concurrently():
+    """Under max_workers>1 the async batch truly interleaves via asyncio.gather: three
+    async scouts are all in-flight at once — a serialized loop (or semaphore=1) could
+    not produce that. Single-threaded, so the shared counter needs no lock."""
+    state = {"live": 0, "peak": 0}
+
+    class _AsyncScout(Executor):
+        async def run(self, inputs, params, ctx):
+            state["live"] += 1
+            state["peak"] = max(state["peak"], state["live"])
+            await asyncio.sleep(0.02)
+            state["live"] -= 1
+            return ExecutionResult(output={"subtopic": params["subtopic"], "facts": []},
+                                   signal=Signal.CONTINUE)
+
+    reg = default_registry()
+    reg[NodeType.SCOUT] = _AsyncScout()
+    store = SQLiteEventStore(":memory:")
+    goal = {"topic": "t", "subtopics": ["a", "b", "c"], "target_score": 0.80}
+    r = Scheduler(store, reg, budget=Budget(), max_workers=3).run(goal)
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    assert state["peak"] >= 2, f"async batch did not overlap (peak in-flight={state['peak']})"
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
 
 
 def main():

@@ -50,3 +50,16 @@ class ActivityRecorder:
         self._new[key] = result
         self.recorded.append((key, result))
         return result
+
+    async def record_async(self, key: str, fn: Callable) -> Any:
+        """Async twin of record(): `await fn()` at most once per node, replaying the
+        recorded result thereafter. For async executors whose steps are coroutines
+        (a real async model client) — same buffer, same commit path."""
+        if key in self._prior:
+            return self._prior[key]
+        if key in self._new:
+            return self._new[key]
+        result = await fn()
+        self._new[key] = result
+        self.recorded.append((key, result))
+        return result

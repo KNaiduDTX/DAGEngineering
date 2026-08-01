@@ -23,6 +23,7 @@ definition of the ready set — semantically irrelevant.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -221,18 +222,57 @@ class Scheduler:
         return _Outcome(node_id=node_id, result=result, activities=recorder.recorded)
 
     def _execute_batch(self, run_id: str, admitted: list, goal: dict) -> list:
-        """Execute the admitted batch (Phase 2 concurrency). Serial by default; with
-        max_workers>1 the pure execute phase runs concurrently in a thread pool —
-        correct for sync, I/O-bound executors (the GIL releases during model/network
-        calls), capped at max_workers (the real WIP limit). Results are returned in
-        ADMITTED order so commit stays serial and the run stays deterministic. Once
-        executors are `async def`, this becomes a literal `asyncio.gather`. Executors
-        must be stateless/thread-safe for concurrent execution."""
+        """Execute the admitted batch (Phase 2 concurrency). Three paths, all pure and
+        all returning outcomes in ADMITTED order so commit stays serial/deterministic:
+          * any `async def` executor in the batch -> **literal `asyncio.gather`** (the
+            async path; sync executors ride along in threads);
+          * else max_workers>1 -> a thread pool (correct for sync I/O-bound executors);
+          * else serial.
+        `max_workers` is the real WIP cap in every path. Executors must be
+        stateless/thread-safe (sync) or coroutine-safe (async)."""
+        if not admitted:
+            return []
+        if any(asyncio.iscoroutinefunction(self.registry[self.graph.nodes[n].node_type].run)
+               for n in admitted):
+            return asyncio.run(self._execute_batch_async(run_id, admitted, goal))
         if self.max_workers <= 1 or len(admitted) <= 1:
             return [self._execute(run_id, node_id, goal) for node_id in admitted]
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             return list(pool.map(lambda node_id: self._execute(run_id, node_id, goal), admitted))
+
+    async def _execute_batch_async(self, run_id: str, admitted: list, goal: dict) -> list:
+        """`asyncio.gather` over the admitted batch — the literal-concurrency path.
+        A semaphore caps concurrency at max_workers (the WIP limit; =1 ⇒ serialized);
+        gather preserves admitted order for a deterministic commit."""
+        sem = asyncio.Semaphore(self.max_workers)
+
+        async def _one(node_id):
+            async with sem:
+                return await self._execute_async(run_id, node_id, goal)
+
+        return list(await asyncio.gather(*(_one(n) for n in admitted)))
+
+    async def _execute_async(self, run_id: str, node_id: str, goal: dict) -> _Outcome:
+        """Async twin of _execute: `await`s an `async def` executor, or runs a sync one
+        in a thread. Same pure-phase contract — reads shared state, buffers activities,
+        writes nothing (commit persists them)."""
+        rec = self.graph.nodes[node_id]
+        inputs = {p: self.graph.nodes[p].output for p in self.graph.in_edges.get(node_id, set())}
+        params = resolve_placeholders(rec.params, inputs)
+        recorder = ActivityRecorder(self.graph.activities.get(node_id))
+        ctx = Context(run_id=run_id, goal=goal, self_id=node_id,
+                      generation=rec.generation, activities=recorder)
+        executor = self.registry[rec.node_type]
+        try:
+            if asyncio.iscoroutinefunction(executor.run):
+                result = await executor.run(inputs, params, ctx)
+            else:
+                result = await asyncio.to_thread(executor.run, inputs, params, ctx)
+            self._validate_result(result)
+        except Exception as exc:
+            return _Outcome(node_id=node_id, error=exc, activities=recorder.recorded)
+        return _Outcome(node_id=node_id, result=result, activities=recorder.recorded)
 
     def _commit(self, run_id: str, outcome: _Outcome, predicate) -> Optional[dict]:
         """Serial, single-writer: fold one execution outcome into the log and graph.

@@ -425,12 +425,14 @@ What changes, and nothing else does:
 
 * **Batch → concurrency.** *Done.* The loop separates a pure **execute** phase from
   the serial **admit**/**commit** phases (§5.4); `Scheduler(max_workers=N)` runs the
-  admitted batch's `_execute` concurrently in a thread pool (correct for sync,
-  I/O-bound executors — the GIL releases during model/network calls), capped at
-  `max_workers` (the real WIP limit). Results commit in admitted order, so the run is
-  deterministic under concurrency (`test_concurrent_execute_matches_serial`). Once
-  executors are `async def`, the pool becomes a literal `asyncio.gather`. The store's
-  `seq` remains the single serialization point.
+  admitted batch concurrently, capped at `max_workers` (the real WIP limit), with
+  results committed in admitted order so the run stays deterministic
+  (`test_concurrent_execute_matches_serial`). Two execute paths: sync executors run in
+  a thread pool (GIL releases during I/O); an **`async def` executor triggers a literal
+  `asyncio.gather`** over the batch (semaphore = WIP cap; `ctx.record_async` for awaited
+  steps) — `test_async_batch_runs_concurrently`. The store's `seq` remains the single
+  serialization point. *Remaining:* distributed workers pulling the frontier +
+  backpressure (single-process today).
 * **SQLite → Postgres**, in-memory projection → **Neo4j** fold. Same events, same
   guards (they sit at the store boundary).
 * **Deterministic executors → real models** at the single `Executor.run` seam.
