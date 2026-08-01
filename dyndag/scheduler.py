@@ -31,7 +31,7 @@ from .core import (Event, EventType, NodeType, Provenance, Signal,
                    TerminationReason, new_batch_id, new_run_id, now_iso,
                    stable_edge_id, stable_node_id)
 from .executors import (Context, ExecutionResult, Executor, MalformedResultError,
-                        ModelRouter)
+                        ModelRouter, TerminalExecutionError)
 from .governor import Budget, CostGovernor
 from .graph import GraphProjection
 from .nodes import NodeSpec, SubgraphPatch, resolve_placeholders
@@ -254,9 +254,14 @@ class Scheduler:
             return self._fail(run_id, node_id, rec, outcome.error)
 
         result = outcome.result
-        # Real cost from the executor's reported token usage (None for mocks). The
-        # governor's unit budget already gated admission pre-call; this is the actual.
-        cost_usd = self.router.cost(rec.tier, result.usage)
+        # Real cost. Prefer the executor's provider-reported dollar cost (exact
+        # per-model $, e.g. OpenRouter's usage.cost); fall back to the router's tier
+        # pricing when only token counts are reported; None for mocks. The governor's
+        # unit budget already gated admission pre-call; this is the actual.
+        if result.usage and result.usage.get("cost") is not None:
+            cost_usd = result.usage["cost"]
+        else:
+            cost_usd = self.router.cost(rec.tier, result.usage)
         self._emit(Event(run_id=run_id, type=EventType.NODE_COMPLETED, node_id=node_id,
                          payload={"output": result.output, "score": result.score,
                                   "signal": result.signal.value,
@@ -271,12 +276,15 @@ class Scheduler:
         return None
 
     def _fail(self, run_id: str, node_id: str, rec, exc: Exception) -> None:
-        """Record a failed attempt and, if the GLOBAL retry budget allows, reopen
-        the node for one more dispatch. Both a raised executor and a malformed
-        result land here, so the scheduler has exactly one failure path."""
+        """Record a failed attempt. A TERMINAL error (model refusal, 4xx, unrecoverable)
+        fails the node WITHOUT spending the retry budget — retrying can't fix it. Any
+        other error is RETRYABLE and, if the global budget allows, reopens the node.
+        Both a raised executor and a malformed result land here (one failure path)."""
+        terminal = isinstance(exc, TerminalExecutionError)
         self._emit(Event(run_id=run_id, type=EventType.NODE_FAILED, node_id=node_id,
-                         payload={"error": repr(exc), "attempt": rec.attempts}))
-        if self.governor.spend_retry():
+                         payload={"error": repr(exc), "attempt": rec.attempts,
+                                  "terminal": terminal}))
+        if not terminal and self.governor.spend_retry():
             self._reopen(run_id, node_id)
         return None
 

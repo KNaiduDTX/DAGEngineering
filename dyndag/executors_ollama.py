@@ -36,30 +36,7 @@ from .core import NodeType, Signal
 from .executors import (ExecutionResult, Executor, MalformedResultError,
                         default_registry)
 from .nodes import NodeSpec, SubgraphPatch
-
-# Flat schemas — a patch-emitting role would need a bounded-depth schema because
-# structured-output backends reject recursive schemas (Phase 1 finding).
-_DRAFT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "covered": {"type": "array", "items": {"type": "string"}},
-        "sections": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {"subtopic": {"type": "string"}, "text": {"type": "string"}},
-                "required": ["subtopic", "text"],
-            },
-        },
-    },
-    "required": ["covered", "sections"],
-}
-
-_REVIEW_SCHEMA = {
-    "type": "object",
-    "properties": {"score": {"type": "number"}, "critique": {"type": "string"}},
-    "required": ["score", "critique"],
-}
+from .schemas import DRAFT_SCHEMA, REVIEW_SCHEMA
 
 
 def _usage_of(resp) -> dict:
@@ -133,7 +110,7 @@ class OllamaEngineerExecutor(Executor):
         ]
         recorded = ctx.record(
             f"draft_rev{revision}",
-            lambda: _ollama_chat_json(self.model, self.host, messages, _DRAFT_SCHEMA,
+            lambda: _ollama_chat_json(self.model, self.host, messages, DRAFT_SCHEMA,
                                       ("covered", "sections"), self.repair_attempts),
         )
         data, usage = recorded["content"], recorded.get("usage")
@@ -177,7 +154,7 @@ class OllamaReviewerExecutor(Executor):
         ]
         recorded = ctx.record(
             f"review_{draft_id}",
-            lambda: _ollama_chat_json(self.model, self.host, messages, _REVIEW_SCHEMA,
+            lambda: _ollama_chat_json(self.model, self.host, messages, REVIEW_SCHEMA,
                                       ("score", "critique"), self.repair_attempts),
         )
         data, usage = recorded["content"], recorded.get("usage")

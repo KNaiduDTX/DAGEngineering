@@ -4,6 +4,7 @@ test_invariants.py — small, dependency-free checks of the load-bearing guarant
 Run:  python test_invariants.py
 """
 
+import json
 import random
 import threading
 
@@ -366,6 +367,185 @@ def test_retrieval_scout_ranks_corpus_and_records():
         "retrieval was not recorded as an activity"
     ok, _, _ = verify_replay(store, r.graph, r.run_id)
     assert ok
+
+
+def test_terminal_error_is_not_retried():
+    """A TerminalExecutionError (e.g. a model refusal / content filter / 4xx) fails the
+    node WITHOUT spending the global retry budget — unlike a retryable error, which
+    reopens and retries. This is the terminal half of the error taxonomy."""
+    from dyndag import TerminalExecutionError
+
+    class _RefusingReviewer(Executor):
+        def run(self, inputs, params, ctx):
+            raise TerminalExecutionError("model refused (content_filter)")
+
+    reg = default_registry()
+    reg[NodeType.REVIEWER] = _RefusingReviewer()
+    store = SQLiteEventStore(":memory:")
+    s = Scheduler(store, reg, budget=Budget(retry_budget=8))
+    r = s.run(dict(ONE))
+    assert s.governor.retries_used == 0, f"terminal error spent {s.governor.retries_used} retries"
+    assert r.reason != TerminationReason.GOAL_SATISFIED, r.reason
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok, "replay diverged after a terminal failure"
+
+
+def _or_completion(content, cost=None, finish="stop", refusal=None):
+    """Build an OpenAI-compatible completion dict for the fake transport."""
+    msg = {"content": content}
+    if refusal is not None:
+        msg["refusal"] = refusal
+    usage = {"prompt_tokens": 120, "completion_tokens": 60}
+    if cost is not None:
+        usage["cost"] = cost
+    return {"choices": [{"message": msg, "finish_reason": finish}], "usage": usage}
+
+
+def _fleet_transport(cost):
+    """A fake transport serving valid plan/draft/review for any task at a fixed per-call
+    cost (the orchestrator post-fills required subtopics, so plan can return no scouts)."""
+    def _t(model, messages, response_format):
+        name = (response_format or {}).get("json_schema", {}).get("name", "")
+        if name == "plan":
+            content = json.dumps({"scouts": [], "engineer_brief": "b", "review_rubric": "r"})
+        elif name == "draft":
+            content = json.dumps({"covered": ["x"], "sections": [{"subtopic": "x", "text": "t"}]})
+        else:  # review
+            content = json.dumps({"score": 0.95, "critique": "ok"})
+        return _or_completion(content, cost=cost)
+    return _t
+
+
+def test_openrouter_executors_run_and_record_provider_cost():
+    """The OpenRouter (OpenAI-compatible) ENGINEER + REVIEWER run end-to-end through an
+    injected fake transport (no network, no key), and the dollar cost recorded is the
+    provider's own `usage.cost` — not a local tier estimate (per-model pricing gotcha)."""
+    from dyndag import openrouter_registry
+
+    def transport(model, messages, response_format):
+        name = (response_format or {}).get("json_schema", {}).get("name", "")
+        if name == "plan":
+            content = json.dumps({"scouts": [{"subtopic": "a", "focus": "f"}],
+                                  "engineer_brief": "b", "review_rubric": "r"})
+        elif name == "draft":
+            content = json.dumps({"covered": ["a"], "sections": [{"subtopic": "a", "text": "real"}]})
+        else:  # review
+            content = json.dumps({"score": 0.95, "critique": "solid"})
+        return _or_completion(content, cost=0.0012)
+
+    reg = openrouter_registry(transport=transport)
+    store = SQLiteEventStore(":memory:")
+    r = Scheduler(store, reg, budget=Budget()).run(dict(ONE))
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    eng = next(rec for nid, rec in r.graph.nodes.items() if nid.startswith("engineer"))
+    assert eng.cost_usd == 0.0012, eng.cost_usd            # provider-reported, not tier pricing
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
+
+
+def test_openrouter_refusal_is_terminal():
+    """A content-filter refusal from the provider becomes a TerminalExecutionError: the
+    node fails and is NOT retried (retrying a refusal just refuses again)."""
+    from dyndag import openrouter_registry
+
+    def transport(model, messages, response_format):
+        return _or_completion(None, finish="content_filter", refusal="disallowed content")
+
+    reg = openrouter_registry(transport=transport)   # ENGINEER will refuse first
+    store = SQLiteEventStore(":memory:")
+    s = Scheduler(store, reg, budget=Budget(retry_budget=8))
+    r = s.run(dict(ONE))
+    assert s.governor.retries_used == 0, f"refusal spent {s.governor.retries_used} retries"
+    assert r.reason != TerminationReason.GOAL_SATISFIED, r.reason
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
+
+
+def test_openrouter_repair_loop_and_cost_extraction():
+    """The validate->repair loop re-prompts on invalid JSON then succeeds, and provider
+    cost is extracted — exercised directly on the reviewer's structured-chat helper."""
+    from dyndag import RetrievalScoutExecutor  # noqa: F401 (ensure package import path)
+    from dyndag.executors_openrouter import OpenRouterReviewerExecutor
+    from dyndag.schemas import REVIEW_SCHEMA
+
+    calls = {"n": 0}
+
+    def transport(model, messages, response_format):
+        calls["n"] += 1
+        content = "not json at all" if calls["n"] == 1 else json.dumps({"score": 0.9, "critique": "ok"})
+        return _or_completion(content, cost=0.0005)
+
+    ex = OpenRouterReviewerExecutor(transport=transport, repair_attempts=2)
+    out = ex._chat_json([{"role": "user", "content": "x"}], REVIEW_SCHEMA, "review",
+                        ("score", "critique"))
+    assert calls["n"] == 2, f"expected one repair, got {calls['n']} calls"
+    assert out["content"]["score"] == 0.9
+    assert out["usage"]["cost"] == 0.0005
+
+
+def test_openrouter_orchestrator_plans_and_guarantees_coverage():
+    """A real ORCHESTRATOR emits a FLAT plan (no recursive patch); the executor
+    assembles the subgraph and POST-FILLS required subtopics the model omitted, so the
+    goal stays reachable. Here the model plans only 'a' and forgets 'b'; 'b' is added,
+    the run reaches the goal, and the plan is a recorded activity."""
+    from dyndag import openrouter_registry
+
+    def transport(model, messages, response_format):
+        name = (response_format or {}).get("json_schema", {}).get("name", "")
+        if name == "plan":                        # model omits required subtopic "b"
+            content = json.dumps({"scouts": [{"subtopic": "a", "focus": "deep"}],
+                                  "engineer_brief": "cover both", "review_rubric": "be strict"})
+        elif name == "draft":
+            content = json.dumps({"covered": ["a", "b"], "sections": [{"subtopic": "a", "text": "x"}]})
+        else:                                     # review
+            content = json.dumps({"score": 0.95, "critique": "ok"})
+        return _or_completion(content, cost=0.001)
+
+    reg = openrouter_registry(transport=transport)   # ORCHESTRATOR + ENGINEER + REVIEWER real
+    store = SQLiteEventStore(":memory:")
+    r = Scheduler(store, reg, budget=Budget()).run(
+        {"topic": "t", "subtopics": ["a", "b"], "target_score": 0.80})
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    scout_keys = {nid.split(".")[0] for nid in r.graph.nodes if nid.startswith("scout")}
+    assert scout_keys == {"scout_a", "scout_b"}, scout_keys   # "b" was post-filled
+    orch = next(rec for nid, rec in r.graph.nodes.items() if nid.startswith("orchestrator"))
+    assert "plan" in r.graph.activities.get(orch.node_id, {}), "plan not recorded as an activity"
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
+
+
+def test_eval_harness_ranks_policies_by_cost():
+    """The cost-routing harness runs a task under two policies (fake cloud transports at
+    different per-call cost), both succeed, and the report + savings_pct show the cheaper
+    policy costs proportionally less — the mechanics of the cost-routing claim, offline."""
+    from dyndag import (EvalTask, cost_routing_report, openrouter_registry, run_eval,
+                        savings_pct)
+
+    task = EvalTask("t", {"topic": "t", "subtopics": ["a", "b"], "target_score": 0.80})
+    policies = {
+        "cheap": lambda: openrouter_registry(transport=_fleet_transport(0.001)),
+        "dear": lambda: openrouter_registry(transport=_fleet_transport(0.010)),
+    }
+    results = run_eval([task], policies)
+    assert results["cheap"]["t"].success and results["dear"]["t"].success
+    assert results["cheap"]["t"].cost_usd < results["dear"]["t"].cost_usd
+    assert results["cheap"]["t"].cost_usd > 0                      # provider cost flowed through
+    pct = savings_pct(results, "cheap", "dear")
+    assert pct is not None and 85.0 <= pct <= 95.0, pct            # 10x cheaper -> ~90%
+    rep = cost_routing_report(results)
+    assert "cheap" in rep and "less than" in rep, rep
+
+
+def test_eval_runs_mock_registry_offline():
+    """The harness runs any registry: the all-mock fleet reaches the goal at zero
+    recorded dollar cost (mocks report no usage)."""
+    from dyndag import EvalTask, run_eval
+
+    task = EvalTask("m", {"topic": "t", "subtopics": ["a"], "target_score": 0.80})
+    results = run_eval([task], {"mock": lambda: default_registry()})
+    tr = results["mock"]["m"]
+    assert tr.success and tr.reason == "goal_satisfied", (tr.success, tr.reason)
+    assert tr.cost_usd == 0.0, tr.cost_usd
 
 
 def main():

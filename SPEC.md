@@ -409,7 +409,10 @@ Module: `governor.CostGovernor`, `scheduler.run`.
 | INV-7.1 four termination reasons | `demo.py` (goal) + `test_budget_terminates_runaway` (cap) + `test_cost_cap_enforced_within_a_wide_tick` (mid-tick budget) |
 | execute/commit ordering deterministic (§5.4, §9) | `test_batch_commit_ordering_is_deterministic`; `test_concurrent_execute_matches_serial` + `test_batch_executes_concurrently` (real parallelism, same result) |
 | recorded activity replayed / exactly-once (§5.2) | `test_recorded_activity_is_replayed_on_retry` |
-| real token→$ cost recorded (§5.3) | `test_real_cost_recorded_from_usage` |
+| real token→$ cost recorded (§5.3) | `test_real_cost_recorded_from_usage`; `test_openrouter_executors_run_and_record_provider_cost` (per-model provider cost) |
+| retryable/terminal taxonomy; refusal not retried (§9) | `test_terminal_error_is_not_retried`; `test_openrouter_refusal_is_terminal` |
+| real ORCHESTRATOR: bounded plan + guaranteed coverage (§9) | `test_openrouter_orchestrator_plans_and_guarantees_coverage` |
+| cost-routing eval measures success vs cost (§9) | `test_eval_harness_ranks_policies_by_cost`; `test_eval_runs_mock_registry_offline` |
 | SSA write-once | `test_single_assignment_write_once` |
 
 Run `python demo.py` and `python test_invariants.py`; both assert these.
@@ -432,12 +435,21 @@ What changes, and nothing else does:
   guards (they sit at the store boundary).
 * **Deterministic executors → real models** at the single `Executor.run` seam.
   Wrap each model/tool/IO call as a recorded Activity so INV-5.1 still holds.
-  *Started:* `executors_ollama` provides a real retrieval SCOUT (ranks a corpus per
-  subtopic; offline lexical default, embeddings-ready) plus a real local-model ENGINEER
-  and REVIEWER (Ollama; structured output + validate/repair; every model call recorded
-  as an activity with real token→$ cost). GOAL/SYNTHESIZER stay mock. With the critic
-  real, convergence is genuine and bounded by the generation cap. Run it with
-  `python demo_ollama.py`.
+  *Done for the local fleet, cloud fleet, and the planner:*
+  - **Local** (`executors_ollama`): retrieval SCOUT (corpus ranking; offline lexical
+    default, embeddings-ready) + Ollama ENGINEER + REVIEWER.
+  - **Cloud** (`executors_openrouter`): OpenAI-compatible ORCHESTRATOR + ENGINEER +
+    REVIEWER via a raw-urllib transport (OpenRouter default; provider-agnostic by
+    base_url — Ollama /v1, vLLM, any skin). No SDK ⇒ `max_retries=0` by construction;
+    refusals/content-filter/4xx → `TerminalExecutionError` (no retry — the terminal
+    half of the retryable/terminal taxonomy); per-model cost is the provider's own
+    `usage.cost`.
+  - **Real ORCHESTRATOR** (the recursive-patch answer): the model emits a *flat* plan
+    (`schemas.PLAN_SCHEMA`) and the executor assembles the subgraph deterministically,
+    post-filling required subtopics for guaranteed coverage.
+  All model calls are recorded activities with real token→$ cost; structured output +
+  validate/repair land on the fail-closed guard (INV-4.2). GOAL/SYNTHESIZER stay mock.
+  Run `python demo_ollama.py` (local) or `python eval_cost_routing.py` (cost routing).
 * **Idempotency keys** on external side-effecting Activities so replay/retry does
   not double-execute the world. *Done at the seam:* `Context.record(key, fn)` +
   `ACTIVITY_RECORDED` make each recorded step exactly-once across retries (§5.2).
@@ -460,10 +472,13 @@ What changes, and nothing else does:
 | `graph.py` | §1.1, §1.4, §6, lineage (§5, §8) |
 | `nodes.py` | §2.1, §2.3 (patch, placeholders) |
 | `activities.py` | §5.2 (recorded activities — replay/idempotency at the executor seam) |
-| `executors.py` | §3.1, §4.1–4.2, §5.3 (roles, critic loop, routing) |
-| `executors_ollama.py` | §3.1, §4.1, §5.2–5.3 (real retrieval SCOUT + Ollama ENGINEER/REVIEWER: structured output, critic loop, recorded activity, token→$ cost) |
+| `schemas.py` | §2.1, §9 (shared structured-output contracts: DRAFT/REVIEW/PLAN — flat, non-recursive) |
+| `executors.py` | §3.1, §4.1–4.2, §5.3, §9 (roles, critic loop, routing, retryable/terminal taxonomy) |
+| `executors_ollama.py` | §3.1, §4.1, §5.2–5.3 (real retrieval SCOUT + Ollama ENGINEER/REVIEWER) |
+| `executors_openrouter.py` | §4.1, §5.2–5.3, §9 (cloud OpenAI-compatible ORCHESTRATOR/ENGINEER/REVIEWER; refusal→terminal; per-model cost) |
+| `evaluation.py` | §9 (cost-routing eval harness: policies, run_eval, cost_routing_report) |
 | `steering.py` | §3.2–3.4 (predicate, filter, beam, value) |
 | `governor.py` | §7 (bounds, retry budget) |
 | `scheduler.py` | §2.2, §5.4 (the loop) |
-| `views.py` | §4.3, §5.2, §8 (blackboard, replay, lineage) |
-| `demo.py`, `test_invariants.py` | §8 (executable proofs) |
+| `views.py` | §4.3, §5.2, §8 (blackboard, replay, lineage, cost report) |
+| `demo.py`, `demo_ollama.py`, `eval_cost_routing.py`, `test_invariants.py` | §8, §9 (executable proofs + live demos) |
