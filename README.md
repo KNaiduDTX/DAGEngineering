@@ -59,15 +59,25 @@ Wrap each model/tool/IO call as a *recorded activity* (`ctx.record(key, fn)`, st
 as an `ACTIVITY_RECORDED` event) so replay/retry never re-runs it — see `SPEC.md`
 §5.2 and §9.
 
-A worked fleet ships in `executors_ollama.py`: a real retrieval **SCOUT** (ranks a
-corpus per subtopic — offline lexical default, embeddings-ready) plus real Ollama
-**ENGINEER** and **REVIEWER** with structured output, a validate/repair loop, recorded
-activities (replay-safe, exactly-once), and real token→$ cost; GOAL/SYNTHESIZER stay
-mock. With a real critic the score is a genuine model judgment and the loop converges
-for real (or terminates on the generation cap). Batches run concurrently under
-`Scheduler(max_workers=N)`. Run it with `python demo_ollama.py` (needs `pip install
-ollama` + a pulled model); it prints a skip notice if Ollama isn't reachable. The
-offline `demo.py` / `test_invariants.py` never require it.
+Real executors ship for both tiers:
+
+* **Local** (`executors_ollama.py`): a retrieval **SCOUT** (ranks a corpus per subtopic
+  — offline lexical default, embeddings-ready) + Ollama **ENGINEER** and **REVIEWER**.
+* **Cloud** (`executors_openrouter.py`): OpenAI-compatible **ORCHESTRATOR**, **ENGINEER**,
+  **REVIEWER** over a raw-`urllib` transport — **provider-agnostic** (OpenRouter default;
+  point `base_url` at Ollama's `/v1`, vLLM, any skin). No SDK, so `max_retries=0` by
+  construction; refusals/content-filter/4xx are **terminal** (never retried); per-model
+  cost is the provider's own `usage.cost`.
+* The **real ORCHESTRATOR** answers the recursive-patch problem: the model emits a *flat*
+  plan and the executor assembles the subgraph deterministically, post-filling required
+  subtopics so coverage is guaranteed.
+
+All model calls are structured-output + validate/repair, recorded as replay-safe
+exactly-once activities, with real token→$ cost. Batches run concurrently under
+`Scheduler(max_workers=N)`. Run `python demo_ollama.py` (local fleet) or
+`python eval_cost_routing.py` (the **cost-routing eval**: all-local vs all-cloud vs
+type-aware). Both skip cleanly when a provider isn't available; the offline
+`demo.py` / `test_invariants.py` never require any.
 
 ## Design commitments (from the approved decisions)
 
