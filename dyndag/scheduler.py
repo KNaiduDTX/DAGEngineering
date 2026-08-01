@@ -445,3 +445,91 @@ class Scheduler:
                          payload={"reason": reason.value}))
         return RunResult(run_id=run_id, reason=reason, terminal_output=terminal_output,
                          ticks=generation, graph=self.graph, governor=self.governor)
+
+    # --------------------------------------------------------------------- #
+    # distributed-worker execution (Phase 2): workers PULL the frontier       #
+    # --------------------------------------------------------------------- #
+    def _max_gen(self) -> int:
+        return max((r.generation for r in self.graph.nodes.values()), default=0)
+
+    def run_workers(self, goal: dict, n_workers: int = 4,
+                    max_inflight: Optional[int] = None) -> RunResult:
+        """Distributed-worker execution. Workers PULL ready nodes from a shared frontier
+        queue and execute the pure phase concurrently; a single-writer coordinator does
+        all admit (route+charge+NODE_STARTED) and commit (NODE_COMPLETED/FAILED, patches,
+        goal check), so the event log stays single-writer even as N workers run. This
+        in-process asyncio implementation is the reference shape; the same coordinator/
+        worker split maps onto real remote workers pulling from a durable queue
+        (Redis/SQS) and posting outcomes back. Produces the same *result* as run() — only
+        the log's interleaving differs (see `test_workers_produce_same_result_as_batch`).
+
+        `max_inflight` is **backpressure**: the coordinator admits at most this many
+        nodes ahead of completion, so it never over-charges cost or floods the queue far
+        beyond what workers can drain; it paces admission to commit. Defaults to
+        2×n_workers (a little pipelining headroom)."""
+        n = max(1, int(n_workers))
+        cap = max(1, int(max_inflight)) if max_inflight is not None else 2 * n
+        return asyncio.run(self._run_workers(goal, n, cap))
+
+    async def _run_workers(self, goal: dict, n_workers: int, max_inflight: int) -> RunResult:
+        run_id = new_run_id()
+        self._emit(Event(run_id=run_id, type=EventType.RUN_STARTED, payload={"goal": goal}))
+        predicate = CoverageGoal(subtopics=goal["subtopics"], target_score=goal["target_score"])
+        goal_id = self._create_node(run_id, "goal", NodeType.GOAL, 0, (),
+                                    {"goal": goal}, expander_id=None)
+        self._create_node(run_id, "orchestrator", NodeType.ORCHESTRATOR, 1,
+                          (goal_id,), {}, expander_id=None)
+
+        frontier_q: asyncio.Queue = asyncio.Queue()
+        results_q: asyncio.Queue = asyncio.Queue()
+        st = {"in_flight": 0, "reason": None, "terminal": None, "stop": False}
+
+        def admit_ready():
+            """Single-writer: admit ready nodes (emitting NODE_STARTED) and enqueue them
+            for workers, up to the backpressure cap (max_inflight admitted-but-uncommitted).
+            Stops on a governor bound; leftover ready nodes are admitted on later calls as
+            commits free capacity."""
+            if st["stop"]:
+                return
+            over = self.governor.check(self.graph, self._max_gen())
+            if over is not None:
+                st["reason"], st["stop"] = over, True
+                return
+            for node_id in self.graph.ready_set():
+                if st["in_flight"] >= max_inflight:      # backpressure: pace admission to commit
+                    break
+                self._admit(run_id, node_id)
+                st["in_flight"] += 1
+                frontier_q.put_nowait(node_id)
+
+        async def worker():
+            while True:
+                node_id = await frontier_q.get()
+                try:
+                    if node_id is None:                    # shutdown sentinel
+                        return
+                    await results_q.put(await self._execute_async(run_id, node_id, goal))
+                finally:
+                    frontier_q.task_done()
+
+        workers = [asyncio.create_task(worker()) for _ in range(n_workers)]
+        admit_ready()
+        while st["in_flight"] > 0 and not st["stop"]:
+            outcome = await results_q.get()
+            st["in_flight"] -= 1
+            candidate = self._commit(run_id, outcome, predicate)   # single-writer
+            if candidate is not None:
+                st["terminal"], st["reason"], st["stop"] = candidate, TerminationReason.GOAL_SATISFIED, True
+                break
+            admit_ready()                                          # commit may ready new nodes
+
+        for _ in workers:                                          # drain + stop workers
+            frontier_q.put_nowait(None)
+        await asyncio.gather(*workers, return_exceptions=True)
+
+        if st["reason"] is None:
+            st["reason"] = TerminationReason.NO_PROGRESS           # frontier drained, goal unmet
+        self._emit(Event(run_id=run_id, type=EventType.RUN_TERMINATED,
+                         payload={"reason": st["reason"].value}))
+        return RunResult(run_id=run_id, reason=st["reason"], terminal_output=st["terminal"],
+                         ticks=self._max_gen(), graph=self.graph, governor=self.governor)
