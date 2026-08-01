@@ -409,7 +409,10 @@ def test_openrouter_executors_run_and_record_provider_cost():
 
     def transport(model, messages, response_format):
         name = (response_format or {}).get("json_schema", {}).get("name", "")
-        if name == "draft":
+        if name == "plan":
+            content = json.dumps({"scouts": [{"subtopic": "a", "focus": "f"}],
+                                  "engineer_brief": "b", "review_rubric": "r"})
+        elif name == "draft":
             content = json.dumps({"covered": ["a"], "sections": [{"subtopic": "a", "text": "real"}]})
         else:  # review
             content = json.dumps({"score": 0.95, "critique": "solid"})
@@ -463,6 +466,37 @@ def test_openrouter_repair_loop_and_cost_extraction():
     assert calls["n"] == 2, f"expected one repair, got {calls['n']} calls"
     assert out["content"]["score"] == 0.9
     assert out["usage"]["cost"] == 0.0005
+
+
+def test_openrouter_orchestrator_plans_and_guarantees_coverage():
+    """A real ORCHESTRATOR emits a FLAT plan (no recursive patch); the executor
+    assembles the subgraph and POST-FILLS required subtopics the model omitted, so the
+    goal stays reachable. Here the model plans only 'a' and forgets 'b'; 'b' is added,
+    the run reaches the goal, and the plan is a recorded activity."""
+    from dyndag import openrouter_registry
+
+    def transport(model, messages, response_format):
+        name = (response_format or {}).get("json_schema", {}).get("name", "")
+        if name == "plan":                        # model omits required subtopic "b"
+            content = json.dumps({"scouts": [{"subtopic": "a", "focus": "deep"}],
+                                  "engineer_brief": "cover both", "review_rubric": "be strict"})
+        elif name == "draft":
+            content = json.dumps({"covered": ["a", "b"], "sections": [{"subtopic": "a", "text": "x"}]})
+        else:                                     # review
+            content = json.dumps({"score": 0.95, "critique": "ok"})
+        return _or_completion(content, cost=0.001)
+
+    reg = openrouter_registry(transport=transport)   # ORCHESTRATOR + ENGINEER + REVIEWER real
+    store = SQLiteEventStore(":memory:")
+    r = Scheduler(store, reg, budget=Budget()).run(
+        {"topic": "t", "subtopics": ["a", "b"], "target_score": 0.80})
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    scout_keys = {nid.split(".")[0] for nid in r.graph.nodes if nid.startswith("scout")}
+    assert scout_keys == {"scout_a", "scout_b"}, scout_keys   # "b" was post-filled
+    orch = next(rec for nid, rec in r.graph.nodes.items() if nid.startswith("orchestrator"))
+    assert "plan" in r.graph.activities.get(orch.node_id, {}), "plan not recorded as an activity"
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
 
 
 def main():

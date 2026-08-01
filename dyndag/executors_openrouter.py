@@ -31,7 +31,7 @@ from .core import NodeType, Signal
 from .executors import (ExecutionResult, Executor, MalformedResultError,
                         TerminalExecutionError, default_registry)
 from .nodes import NodeSpec, SubgraphPatch
-from .schemas import DRAFT_SCHEMA, REVIEW_SCHEMA
+from .schemas import DRAFT_SCHEMA, PLAN_SCHEMA, REVIEW_SCHEMA
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -213,15 +213,74 @@ class OpenRouterReviewerExecutor(_OpenRouterExecutor):
                                patch=SubgraphPatch(added_nodes=[synth]))
 
 
+class OpenRouterOrchestratorExecutor(_OpenRouterExecutor):
+    """The expander, for real — and the answer to the recursive-patch problem. Rather
+    than have the model emit a `SubgraphPatch` (recursive, unvalidatable, rejected by
+    structured-output backends), the model emits a FLAT plan (which scouts to run, a
+    brief for the engineer, a review rubric) and this executor assembles the
+    scouts -> engineer -> reviewer subgraph deterministically. The model chooses content
+    within a fixed template; the code builds the DAG — safe by construction.
+
+    Coverage is guaranteed: every required subtopic gets a scout even if the model
+    omits it (post-fill), so the goal predicate stays reachable no matter what the
+    model plans."""
+
+    def run(self, inputs, params, ctx) -> ExecutionResult:
+        goal = ctx.goal if isinstance(ctx.goal, dict) else {}
+        required = list(goal.get("subtopics", []))
+        topic = goal.get("topic", "")
+        target = goal.get("target_score", 0.8)
+        messages = [
+            {"role": "system", "content": (
+                "You are a research orchestrator. Plan how to produce a vetted brief: choose "
+                "the scouts (one per subtopic to investigate, each with a focus), a brief for "
+                "the engineer, and a review rubric. You MUST include every required subtopic "
+                "among the scouts. Respond with JSON only.")},
+            {"role": "user", "content": json.dumps({
+                "topic": topic, "required_subtopics": required, "target_score": target})},
+        ]
+        recorded = ctx.record("plan",
+                              lambda: self._chat_json(messages, PLAN_SCHEMA, "plan",
+                                                      ("scouts", "engineer_brief", "review_rubric")))
+        data, usage = recorded["content"], recorded.get("usage")
+
+        # Deterministic assembly. Model picks scout subtopics/focus; we GUARANTEE the
+        # required subtopics are covered (post-fill any the model omitted).
+        planned: dict = {}
+        for s in data.get("scouts", []):
+            if isinstance(s, dict) and s.get("subtopic"):
+                planned[str(s["subtopic"])] = str(s.get("focus", ""))
+        for st in required:
+            planned.setdefault(st, "")
+        subtopics = list(planned.keys())
+
+        scouts = [NodeSpec(key=f"scout_{st}", node_type=NodeType.SCOUT,
+                           input_keys=(ctx.self_id,),
+                           params={"subtopic": st, "topic": topic, "focus": focus})
+                  for st, focus in planned.items()]
+        engineer = NodeSpec(key="engineer", node_type=NodeType.ENGINEER,
+                            input_keys=tuple(s.key for s in scouts),
+                            params={"topic": topic, "subtopics": subtopics, "revision": 0,
+                                    "brief": data.get("engineer_brief", "")})
+        reviewer = NodeSpec(key="reviewer", node_type=NodeType.REVIEWER, input_keys=("engineer",),
+                            params={"target_score": target, "subtopics": subtopics,
+                                    "rubric": data.get("review_rubric", "")})
+        patch = SubgraphPatch(added_nodes=[*scouts, engineer, reviewer])
+        return ExecutionResult(
+            output={"plan": subtopics, "engineer_brief": data.get("engineer_brief", "")},
+            signal=Signal.CONTINUE, patch=patch, usage=usage)
+
+
 def openrouter_registry(model: str = "openai/gpt-4o-mini", base_url: str = OPENROUTER_BASE_URL,
                         api_key: Optional[str] = None, transport: Optional[Transport] = None,
                         **kwargs) -> dict:
-    """`default_registry()` with ENGINEER and REVIEWER over the OpenAI-compatible API
-    (OpenRouter default). The ORCHESTRATOR is added in the next slice; GOAL/SCOUT/
-    SYNTHESIZER stay mock. Pass `transport=` to target a fake (tests) or any other
-    OpenAI-compatible endpoint (e.g. Ollama's /v1) without changing the executors."""
+    """`default_registry()` with a real ORCHESTRATOR, ENGINEER, and REVIEWER over the
+    OpenAI-compatible API (OpenRouter default). GOAL/SCOUT/SYNTHESIZER stay mock (the
+    eval composes a real retrieval SCOUT where wanted). Pass `transport=` to target a
+    fake (tests) or any other OpenAI-compatible endpoint (e.g. Ollama's /v1)."""
     common = dict(model=model, base_url=base_url, api_key=api_key, transport=transport, **kwargs)
     registry = default_registry()
+    registry[NodeType.ORCHESTRATOR] = OpenRouterOrchestratorExecutor(**common)
     registry[NodeType.ENGINEER] = OpenRouterEngineerExecutor(**common)
     registry[NodeType.REVIEWER] = OpenRouterReviewerExecutor(**common)
     return registry

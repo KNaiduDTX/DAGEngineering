@@ -14,7 +14,8 @@ from .executors import (Executor, ExecutionResult, Context, ModelRouter,
 from .executors_ollama import (OllamaEngineerExecutor, OllamaReviewerExecutor,
                                RetrievalScoutExecutor, ollama_registry)
 from .executors_openrouter import (OpenRouterEngineerExecutor, OpenRouterReviewerExecutor,
-                                   openrouter_registry, http_transport)
+                                   OpenRouterOrchestratorExecutor, openrouter_registry,
+                                   http_transport)
 from .steering import CoverageGoal, ConstraintFilter
 from .governor import Budget, CostGovernor
 from .scheduler import Scheduler, RunResult
@@ -26,8 +27,8 @@ __all__ = [
     "NodeSpec", "SubgraphPatch", "Executor", "ExecutionResult", "Context",
     "ActivityRecorder", "OllamaEngineerExecutor", "OllamaReviewerExecutor",
     "RetrievalScoutExecutor", "ollama_registry",
-    "OpenRouterEngineerExecutor", "OpenRouterReviewerExecutor", "openrouter_registry",
-    "http_transport",
+    "OpenRouterEngineerExecutor", "OpenRouterReviewerExecutor",
+    "OpenRouterOrchestratorExecutor", "openrouter_registry", "http_transport",
     "ModelRouter", "MalformedResultError", "TerminalExecutionError",
     "default_registry", "CoverageGoal", "ConstraintFilter",
     "Budget", "CostGovernor", "NodeType", "NodeState", "Signal", "Tier",
