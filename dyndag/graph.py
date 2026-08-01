@@ -41,7 +41,9 @@ class NodeRecord:
     output: Any = None
     score: Optional[float] = None
     tier: Optional[str] = None            # model tier chosen at dispatch (cost view)
-    cost: float = 0.0
+    cost: float = 0.0                      # nominal cost units (governor budget)
+    usage: Optional[dict] = None          # real token counts reported by the executor
+    cost_usd: Optional[float] = None      # real dollar cost derived from usage (Layer 5)
     attempts: int = 0
     params: dict = field(default_factory=dict)
 
@@ -79,6 +81,8 @@ class GraphProjection:
             n.state = NodeState.COMPLETED
             n.output = e.payload.get("output")
             n.score = e.payload.get("score")
+            n.usage = e.payload.get("usage")
+            n.cost_usd = e.payload.get("cost_usd")
         elif t == EventType.NODE_FAILED:
             self.nodes[e.node_id].state = NodeState.FAILED
         elif t == EventType.NODE_REOPENED:

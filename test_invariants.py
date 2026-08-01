@@ -272,6 +272,39 @@ def test_synthesizer_uses_reviewer_score_not_draft_selfreport():
     assert ok
 
 
+def test_real_cost_recorded_from_usage():
+    """Executor-reported token usage becomes real $ via the ModelRouter's tier pricing,
+    recorded in NODE_COMPLETED and replayed. The governor's unit budget is unchanged
+    (pre-call gate); this is the post-call actual (Layer 5 cost accounting)."""
+    from dyndag import cost_report
+
+    class _CloudReviewer(Executor):   # REVIEWER routes to the cloud tier (5/25 per MTok)
+        def run(self, inputs, params, ctx):
+            draft_id = next(k for k, v in inputs.items()
+                            if isinstance(v, dict) and v.get("kind") == "draft")
+            synth = NodeSpec(key="synthesizer", node_type=NodeType.SYNTHESIZER,
+                             input_keys=(draft_id, ctx.self_id),
+                             params={"subtopics": params["subtopics"],
+                                     "target_score": params["target_score"]})
+            return ExecutionResult(output={"verdict": "approve", "score": 0.9},
+                                   signal=Signal.DONE, score=0.9,
+                                   usage={"input_tokens": 1000, "output_tokens": 500},
+                                   patch=SubgraphPatch(added_nodes=[synth]))
+
+    reg = default_registry()
+    reg[NodeType.REVIEWER] = _CloudReviewer()
+    store = SQLiteEventStore(":memory:")
+    r = Scheduler(store, reg, budget=Budget()).run(dict(ONE))
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    reviewer = next(rec for nid, rec in r.graph.nodes.items() if nid.startswith("reviewer"))
+    assert reviewer.usage == {"input_tokens": 1000, "output_tokens": 500}
+    assert abs(reviewer.cost_usd - 0.0175) < 1e-9, reviewer.cost_usd   # (1000*5 + 500*25)/1e6
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok, "replay diverged with cost recorded"
+    rep = cost_report(r.graph)
+    assert "1000 in" in rep and "500 out" in rep, rep
+
+
 def main():
     tests = [v for k, v in globals().items() if k.startswith("test_")]
     for t in tests:

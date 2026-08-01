@@ -47,6 +47,7 @@ class ExecutionResult:
     signal: Signal = Signal.CONTINUE           # TYPED completion — never parsed from text
     score: Optional[float] = None              # critic value (Layer 3)
     patch: Optional[SubgraphPatch] = None      # on-the-fly construction (Layer 2)
+    usage: Optional[dict] = None               # real token counts {input_tokens, output_tokens} (Layer 5 cost)
 
 
 @dataclass
@@ -101,8 +102,29 @@ class ModelRouter:
     }
     _DEFAULT = ModelBinding("local-8b", Tier.LOCAL, 1.0)
 
+    # Real $/1M-token rates by tier (verified 2026). LOCAL has no per-token API cost;
+    # CLOUD carries a representative rate — refine to per-model rates when a cloud
+    # executor lands (e.g. opus-5 5/25, sonnet-5 3/15, haiku-4.5 1/5 per MTok).
+    _PRICING: dict[Tier, tuple[float, float]] = {
+        Tier.LOCAL: (0.0, 0.0),
+        Tier.CLOUD: (5.0, 25.0),
+    }
+
     def route(self, node_type: NodeType) -> ModelBinding:
         return self._POLICY.get(node_type, self._DEFAULT)
+
+    def cost(self, tier: Optional[str], usage: Optional[dict]) -> Optional[float]:
+        """Real dollar cost from token counts. `tier` is the recorded tier string
+        ('local'/'cloud'); `usage` is {input_tokens, output_tokens}. Returns None when
+        an executor reported no usage (e.g. a mock) — the governor's unit budget stays
+        the pre-call admission gate; this is the post-call actual, for accounting."""
+        if not usage or tier is None:
+            return None
+        rate = self._PRICING.get(Tier(tier)) if tier in (t.value for t in Tier) else None
+        if rate is None:
+            return None
+        return (usage.get("input_tokens", 0) * rate[0]
+                + usage.get("output_tokens", 0) * rate[1]) / 1_000_000
 
 
 # --------------------------------------------------------------------------- #

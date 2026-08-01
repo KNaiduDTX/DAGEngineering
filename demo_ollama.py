@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import sys
 
-from dyndag import Budget, Scheduler, SQLiteEventStore, lineage_report, verify_replay
+from dyndag import (Budget, Scheduler, SQLiteEventStore, cost_report,
+                    lineage_report, verify_replay)
 from dyndag.executors_ollama import ollama_registry
 
 
@@ -84,6 +85,8 @@ def main() -> None:
     ok, live_h, rep_h = verify_replay(store, result.graph, result.run_id)
     print(f"replay identical   : {ok}")
 
+    print()
+    print(cost_report(result.graph))
     print()
     print(lineage_report(result.graph))
 

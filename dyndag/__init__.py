@@ -16,7 +16,8 @@ from .executors_ollama import (OllamaEngineerExecutor, OllamaReviewerExecutor,
 from .steering import CoverageGoal, ConstraintFilter
 from .governor import Budget, CostGovernor
 from .scheduler import Scheduler, RunResult
-from .views import render_blackboard, verify_replay, lineage_report, provenance_gaps
+from .views import (render_blackboard, verify_replay, lineage_report,
+                    provenance_gaps, cost_report)
 
 __all__ = [
     "Scheduler", "RunResult", "SQLiteEventStore", "EventStore", "GraphProjection",
@@ -26,4 +27,5 @@ __all__ = [
     "Budget", "CostGovernor", "NodeType", "NodeState", "Signal", "Tier",
     "TerminationReason", "Provenance", "Event", "EventType",
     "render_blackboard", "verify_replay", "lineage_report", "provenance_gaps",
+    "cost_report",
 ]

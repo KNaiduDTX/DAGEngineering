@@ -61,12 +61,21 @@ _REVIEW_SCHEMA = {
 }
 
 
+def _usage_of(resp) -> dict:
+    """Real token counts from an Ollama ChatResponse (dict or object)."""
+    get = (lambda k: resp.get(k)) if isinstance(resp, dict) else (lambda k: getattr(resp, k, None))
+    return {"input_tokens": get("prompt_eval_count") or 0,
+            "output_tokens": get("eval_count") or 0}
+
+
 def _ollama_chat_json(model: str, host: Optional[str], messages: list,
                       schema: dict, required: tuple, repair_attempts: int) -> dict:
     """Call the model with a JSON-schema constraint, parse, validate the required keys,
-    and repair on failure by showing the model its bad output. Returns the parsed dict
-    (JSON-serializable, so it round-trips the event log). Raises MalformedResultError
-    if repair is exhausted -> the scheduler treats it as a failed attempt (fail-closed)."""
+    and repair on failure by showing the model its bad output. Returns
+    {"content": <parsed dict>, "usage": {input_tokens, output_tokens}} — both
+    JSON-serializable, so the whole thing round-trips the event log as one recorded
+    activity (real cost is replayed too). Raises MalformedResultError if repair is
+    exhausted -> the scheduler treats it as a failed attempt (fail-closed)."""
     try:
         import ollama
     except ImportError as exc:
@@ -85,7 +94,7 @@ def _ollama_chat_json(model: str, host: Optional[str], messages: list,
             data = json.loads(content)
             if not isinstance(data, dict) or any(k not in data for k in required):
                 raise ValueError(f"missing required keys {required}")
-            return data
+            return {"content": data, "usage": _usage_of(resp)}
         except (json.JSONDecodeError, ValueError) as err:
             last_err = str(err)
             convo = convo + [
@@ -121,11 +130,12 @@ class OllamaEngineerExecutor(Executor):
                 "source_material": material,
                 "critique_to_address": params.get("critique")})},
         ]
-        data = ctx.record(
+        recorded = ctx.record(
             f"draft_rev{revision}",
             lambda: _ollama_chat_json(self.model, self.host, messages, _DRAFT_SCHEMA,
                                       ("covered", "sections"), self.repair_attempts),
         )
+        data, usage = recorded["content"], recorded.get("usage")
         quality = round(0.60 + 0.30 * min(revision, 1), 3)   # deterministic — mock critic path
         return ExecutionResult(
             output={
@@ -136,7 +146,7 @@ class OllamaEngineerExecutor(Executor):
                 "sections": {s.get("subtopic", ""): s.get("text", "")
                              for s in data.get("sections", []) if isinstance(s, dict)},
             },
-            signal=Signal.CONTINUE, score=quality)
+            signal=Signal.CONTINUE, score=quality, usage=usage)
 
 
 class OllamaReviewerExecutor(Executor):
@@ -164,11 +174,12 @@ class OllamaReviewerExecutor(Executor):
                 "required_subtopics": subtopics, "target_score": target,
                 "brief_sections": draft.get("sections", {})})},
         ]
-        data = ctx.record(
+        recorded = ctx.record(
             f"review_{draft_id}",
             lambda: _ollama_chat_json(self.model, self.host, messages, _REVIEW_SCHEMA,
                                       ("score", "critique"), self.repair_attempts),
         )
+        data, usage = recorded["content"], recorded.get("usage")
         score = max(0.0, min(1.0, float(data["score"])))
         critique = str(data.get("critique", ""))
 
@@ -184,7 +195,7 @@ class OllamaReviewerExecutor(Executor):
                 params={"target_score": target, "subtopics": subtopics})
             return ExecutionResult(
                 output={"verdict": "reject", "score": round(score, 3), "critique": critique},
-                signal=Signal.NEEDS_REFINEMENT, score=score,
+                signal=Signal.NEEDS_REFINEMENT, score=score, usage=usage,
                 patch=SubgraphPatch(added_nodes=[refined, re_review]))
 
         # approve: emit the aggregator that converges to the terminal output
@@ -194,7 +205,7 @@ class OllamaReviewerExecutor(Executor):
             params={"subtopics": subtopics, "target_score": target})
         return ExecutionResult(
             output={"verdict": "approve", "score": round(score, 3)},
-            signal=Signal.DONE, score=score,
+            signal=Signal.DONE, score=score, usage=usage,
             patch=SubgraphPatch(added_nodes=[synth]))
 
 

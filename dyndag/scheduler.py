@@ -238,9 +238,13 @@ class Scheduler:
             return self._fail(run_id, node_id, rec, outcome.error)
 
         result = outcome.result
+        # Real cost from the executor's reported token usage (None for mocks). The
+        # governor's unit budget already gated admission pre-call; this is the actual.
+        cost_usd = self.router.cost(rec.tier, result.usage)
         self._emit(Event(run_id=run_id, type=EventType.NODE_COMPLETED, node_id=node_id,
                          payload={"output": result.output, "score": result.score,
-                                  "signal": result.signal.value}))
+                                  "signal": result.signal.value,
+                                  "usage": result.usage, "cost_usd": cost_usd}))
         if result.patch is not None:
             self._apply_patch(run_id, node_id, result.patch)
 
