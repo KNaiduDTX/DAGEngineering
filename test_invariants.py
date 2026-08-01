@@ -4,6 +4,7 @@ test_invariants.py — small, dependency-free checks of the load-bearing guarant
 Run:  python test_invariants.py
 """
 
+import json
 import random
 import threading
 
@@ -366,6 +367,102 @@ def test_retrieval_scout_ranks_corpus_and_records():
         "retrieval was not recorded as an activity"
     ok, _, _ = verify_replay(store, r.graph, r.run_id)
     assert ok
+
+
+def test_terminal_error_is_not_retried():
+    """A TerminalExecutionError (e.g. a model refusal / content filter / 4xx) fails the
+    node WITHOUT spending the global retry budget — unlike a retryable error, which
+    reopens and retries. This is the terminal half of the error taxonomy."""
+    from dyndag import TerminalExecutionError
+
+    class _RefusingReviewer(Executor):
+        def run(self, inputs, params, ctx):
+            raise TerminalExecutionError("model refused (content_filter)")
+
+    reg = default_registry()
+    reg[NodeType.REVIEWER] = _RefusingReviewer()
+    store = SQLiteEventStore(":memory:")
+    s = Scheduler(store, reg, budget=Budget(retry_budget=8))
+    r = s.run(dict(ONE))
+    assert s.governor.retries_used == 0, f"terminal error spent {s.governor.retries_used} retries"
+    assert r.reason != TerminationReason.GOAL_SATISFIED, r.reason
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok, "replay diverged after a terminal failure"
+
+
+def _or_completion(content, cost=None, finish="stop", refusal=None):
+    """Build an OpenAI-compatible completion dict for the fake transport."""
+    msg = {"content": content}
+    if refusal is not None:
+        msg["refusal"] = refusal
+    usage = {"prompt_tokens": 120, "completion_tokens": 60}
+    if cost is not None:
+        usage["cost"] = cost
+    return {"choices": [{"message": msg, "finish_reason": finish}], "usage": usage}
+
+
+def test_openrouter_executors_run_and_record_provider_cost():
+    """The OpenRouter (OpenAI-compatible) ENGINEER + REVIEWER run end-to-end through an
+    injected fake transport (no network, no key), and the dollar cost recorded is the
+    provider's own `usage.cost` — not a local tier estimate (per-model pricing gotcha)."""
+    from dyndag import openrouter_registry
+
+    def transport(model, messages, response_format):
+        name = (response_format or {}).get("json_schema", {}).get("name", "")
+        if name == "draft":
+            content = json.dumps({"covered": ["a"], "sections": [{"subtopic": "a", "text": "real"}]})
+        else:  # review
+            content = json.dumps({"score": 0.95, "critique": "solid"})
+        return _or_completion(content, cost=0.0012)
+
+    reg = openrouter_registry(transport=transport)
+    store = SQLiteEventStore(":memory:")
+    r = Scheduler(store, reg, budget=Budget()).run(dict(ONE))
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    eng = next(rec for nid, rec in r.graph.nodes.items() if nid.startswith("engineer"))
+    assert eng.cost_usd == 0.0012, eng.cost_usd            # provider-reported, not tier pricing
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
+
+
+def test_openrouter_refusal_is_terminal():
+    """A content-filter refusal from the provider becomes a TerminalExecutionError: the
+    node fails and is NOT retried (retrying a refusal just refuses again)."""
+    from dyndag import openrouter_registry
+
+    def transport(model, messages, response_format):
+        return _or_completion(None, finish="content_filter", refusal="disallowed content")
+
+    reg = openrouter_registry(transport=transport)   # ENGINEER will refuse first
+    store = SQLiteEventStore(":memory:")
+    s = Scheduler(store, reg, budget=Budget(retry_budget=8))
+    r = s.run(dict(ONE))
+    assert s.governor.retries_used == 0, f"refusal spent {s.governor.retries_used} retries"
+    assert r.reason != TerminationReason.GOAL_SATISFIED, r.reason
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
+
+
+def test_openrouter_repair_loop_and_cost_extraction():
+    """The validate->repair loop re-prompts on invalid JSON then succeeds, and provider
+    cost is extracted — exercised directly on the reviewer's structured-chat helper."""
+    from dyndag import RetrievalScoutExecutor  # noqa: F401 (ensure package import path)
+    from dyndag.executors_openrouter import OpenRouterReviewerExecutor
+    from dyndag.schemas import REVIEW_SCHEMA
+
+    calls = {"n": 0}
+
+    def transport(model, messages, response_format):
+        calls["n"] += 1
+        content = "not json at all" if calls["n"] == 1 else json.dumps({"score": 0.9, "critique": "ok"})
+        return _or_completion(content, cost=0.0005)
+
+    ex = OpenRouterReviewerExecutor(transport=transport, repair_attempts=2)
+    out = ex._chat_json([{"role": "user", "content": "x"}], REVIEW_SCHEMA, "review",
+                        ("score", "critique"))
+    assert calls["n"] == 2, f"expected one repair, got {calls['n']} calls"
+    assert out["content"]["score"] == 0.9
+    assert out["usage"]["cost"] == 0.0005
 
 
 def main():

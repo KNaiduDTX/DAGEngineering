@@ -38,7 +38,17 @@ class MalformedResultError(ValueError):
     graph (fail-closed). The mock fleet always returns valid results, but a real
     model will not: this is the boundary where structured-output validation and a
     JSON-mode/repair loop attach (SPEC §9, item 2), so the messiness of a model
-    can never corrupt the substrate below it."""
+    can never corrupt the substrate below it. RETRYABLE: a fresh dispatch may
+    produce valid output, so the scheduler spends a global retry on it."""
+
+
+class TerminalExecutionError(Exception):
+    """An executor failed in a way retrying cannot fix — a model refusal / content
+    filter, a 4xx request error, or any unrecoverable condition. The scheduler fails
+    the node WITHOUT spending the retry budget (retrying the same prompt just refuses
+    again). This is the terminal half of the retryable/terminal error taxonomy
+    (SPEC §9): raise this for refusals and permanent errors; raise anything else
+    (or MalformedResultError) for retryable ones."""
 
 
 @dataclass
