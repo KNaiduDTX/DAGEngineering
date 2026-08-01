@@ -8,18 +8,25 @@ from .core import (NodeType, NodeState, Signal, Tier, TerminationReason,
 from .store import SQLiteEventStore, EventStore
 from .graph import GraphProjection
 from .nodes import NodeSpec, SubgraphPatch
+from .activities import ActivityRecorder
 from .executors import (Executor, ExecutionResult, Context, ModelRouter,
-                        default_registry)
+                        MalformedResultError, default_registry)
+from .executors_ollama import (OllamaEngineerExecutor, OllamaReviewerExecutor,
+                               RetrievalScoutExecutor, ollama_registry)
 from .steering import CoverageGoal, ConstraintFilter
 from .governor import Budget, CostGovernor
 from .scheduler import Scheduler, RunResult
-from .views import render_blackboard, verify_replay, lineage_report, provenance_gaps
+from .views import (render_blackboard, verify_replay, lineage_report,
+                    provenance_gaps, cost_report)
 
 __all__ = [
     "Scheduler", "RunResult", "SQLiteEventStore", "EventStore", "GraphProjection",
     "NodeSpec", "SubgraphPatch", "Executor", "ExecutionResult", "Context",
-    "ModelRouter", "default_registry", "CoverageGoal", "ConstraintFilter",
+    "ActivityRecorder", "OllamaEngineerExecutor", "OllamaReviewerExecutor",
+    "RetrievalScoutExecutor", "ollama_registry",
+    "ModelRouter", "MalformedResultError", "default_registry", "CoverageGoal", "ConstraintFilter",
     "Budget", "CostGovernor", "NodeType", "NodeState", "Signal", "Tier",
     "TerminationReason", "Provenance", "Event", "EventType",
     "render_blackboard", "verify_replay", "lineage_report", "provenance_gaps",
+    "cost_report",
 ]

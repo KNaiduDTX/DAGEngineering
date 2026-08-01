@@ -41,7 +41,9 @@ class NodeRecord:
     output: Any = None
     score: Optional[float] = None
     tier: Optional[str] = None            # model tier chosen at dispatch (cost view)
-    cost: float = 0.0
+    cost: float = 0.0                      # nominal cost units (governor budget)
+    usage: Optional[dict] = None          # real token counts reported by the executor
+    cost_usd: Optional[float] = None      # real dollar cost derived from usage (Layer 5)
     attempts: int = 0
     params: dict = field(default_factory=dict)
 
@@ -53,6 +55,9 @@ class GraphProjection:
         self.in_edges: dict[str, set[str]] = {}
         self.terminal_node: Optional[str] = None
         self.terminated_reason: Optional[str] = None
+        # node_id -> {activity_key: recorded_result}; the replay cache that makes
+        # nondeterministic executor sub-steps exactly-once (see activities.py).
+        self.activities: dict[str, dict[str, Any]] = {}
 
     # --------------------------------------------------------------------- #
     # Folding: apply(event) is the ONLY way the projection changes           #
@@ -76,8 +81,19 @@ class GraphProjection:
             n.state = NodeState.COMPLETED
             n.output = e.payload.get("output")
             n.score = e.payload.get("score")
+            n.usage = e.payload.get("usage")
+            n.cost_usd = e.payload.get("cost_usd")
         elif t == EventType.NODE_FAILED:
             self.nodes[e.node_id].state = NodeState.FAILED
+        elif t == EventType.NODE_REOPENED:
+            # Return a FAILED node to the frontier. This is folded from a LOGGED
+            # fact (never an out-of-band mutation), so replay reconstructs the
+            # same state and INV-5.2 holds even when a run ends mid-retry.
+            self.nodes[e.node_id].state = NodeState.CREATED
+        elif t == EventType.ACTIVITY_RECORDED:
+            # Cache a nondeterministic sub-step's result so a re-execution of this
+            # node replays it instead of calling out again (see activities.py).
+            self.activities.setdefault(e.node_id, {})[e.payload["key"]] = e.payload["result"]
         elif t == EventType.GOAL_SATISFIED:
             self.terminal_node = e.node_id
         elif t == EventType.RUN_TERMINATED:

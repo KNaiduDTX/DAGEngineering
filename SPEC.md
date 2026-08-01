@@ -112,6 +112,8 @@ Module: `graph.GraphProjection.ready_set`.
 | `NODE_STARTED` | `tier, model, cost` | dispatch + cost, stamps `started_at` |
 | `NODE_COMPLETED` | `output, score, signal` | single-assignment write |
 | `NODE_FAILED` | `error, attempt` | retry accounting |
+| `NODE_REOPENED` | `attempt` | returns a FAILED node to the frontier as a *logged fact*, not a state mutation |
+| `ACTIVITY_RECORDED` | `key, result` | a nondeterministic sub-step's result, recorded for replay / exactly-once |
 | `SUBGRAPH_EMITTED` | `added_nodes` | lineage of construction |
 | `NODE_PRUNED` | `key, reason, expander_id` | constraint-filter audit |
 | `GOAL_SATISFIED` | `output` | terminal acceptance |
@@ -232,8 +234,14 @@ token parsed from `output`.
 > **INV-4.1.** Node completion is a typed `ExecutionResult.signal`, and the
 > scheduler branches only on it. The 'agent emitted `<complete>` as a literal
 > string' failure class is unrepresentable.
+> **INV-4.2 (fail-closed).** A result that is not a well-formed `ExecutionResult`
+> — wrong type, an untyped `signal`, a non-numeric `score`, or a malformed patch —
+> is rejected *at the dispatch boundary* and handled as a failed attempt; the
+> scheduler never folds unvalidated output into the log or graph. This is the seam
+> where a real model's structured-output validation + repair loop attaches (§9).
 
-Module: `executors.Executor`, `executors.ExecutionResult`.
+Module: `executors.Executor`, `executors.ExecutionResult`,
+`executors.MalformedResultError`, enforced in `scheduler._validate_result`.
 
 ### 4.2 Roles are types, not personalities
 
@@ -287,11 +295,18 @@ Everything nondeterministic (model calls, IO, timestamps, randomness) is an
 **Activity** whose *result is recorded* as an event; the orchestration loop
 consumes recorded results. This is the Temporal Workflow/Activity discipline.
 
+This is realized at the executor seam by `Context.record(key, fn)`: the first run of
+a step emits `ACTIVITY_RECORDED(key, result)`; any re-execution of the node (the
+failure-path retry, or crash recovery) **replays** the recorded result instead of
+calling `fn` again — the mechanism for exactly-once model calls and side effects. The
+recorder buffers during the pure execute phase and the serial commit phase writes the
+events, so the execute/commit boundary (§5.4) is preserved.
+
 > **INV-5.1.** No node output is recomputed on recovery; it is read from
-> `NODE_COMPLETED`.
+> `NODE_COMPLETED`. A recorded sub-step is likewise replayed, not re-run.
 > **INV-5.2.** `replay(log).structural_hash() == live.structural_hash()`.
 
-Module: `graph.GraphProjection.replay`, `views.verify_replay`.
+Module: `graph.GraphProjection.replay`, `views.verify_replay`, `activities.ActivityRecorder`.
 
 ### 5.3 Cost routing
 
@@ -311,15 +326,25 @@ loop:
     frontier = ready_set()                     # the parallel batch
     if frontier == ∅: terminate(NO_PROGRESS)   # deadlock/starvation guard
     frontier = beam_prune(frontier)            # optional
-    for node in frontier:                       # concurrency unit in prod
-        route + charge + NODE_STARTED
-        inputs = producer outputs; resolve placeholders
-        result = executor.run(...)   # on exception: spend global retry, reopen
-        NODE_COMPLETED(output, score, signal)
-        if result.patch: apply_patch()          # §2.2
-        if signal == GOAL and predicate(output): GOAL_SATISFIED; terminate
+
+    admit:   for node in frontier:             # SERIAL, single-writer
+                 if governor.check(): break     # cost cap enforced as it accrues
+                 route + charge + NODE_STARTED
+    execute: outcomes = [run(node) for node in admitted]   # PURE; Phase 2: asyncio.gather
+                 # each run(): resolve inputs, executor.run(...), validate(result)
+                 # raised OR malformed -> carried as a failure outcome
+    commit:  for outcome in outcomes:          # SERIAL, single-writer, deterministic
+                 if outcome.failed: NODE_FAILED; spend global retry; NODE_REOPENED (logged)
+                 else: NODE_COMPLETED(output, score, signal); if patch: apply_patch()  # §2.2
+                       if signal == GOAL and predicate(output): GOAL_SATISFIED; terminate
+
     generation += 1; if > cap: terminate(GENERATION_CAP)
 ```
+
+The batch is dataflow-independent but not side-effect-independent, so **admit** and
+**commit** (which touch the governor, graph, and store) stay serial and are the
+single-writer serialization point; only **execute** is pure. This is the
+execute-parallel / commit-serially boundary Phase 2 parallelizes (§9).
 
 ---
 
@@ -373,13 +398,18 @@ Module: `governor.CostGovernor`, `scheduler.run`.
 
 | Invariant | Proof in code |
 |---|---|
-| INV-0 / INV-5.2 log is source of truth; replay identical | `demo.py` DURABILITY; `test_cross_run_determinism` |
+| INV-0 / INV-5.2 log is source of truth; replay identical | `demo.py` DURABILITY; `test_cross_run_determinism`; `test_reopen_survives_replay_when_run_caps_after_failure`; `test_replay_equivalence_under_random_failures` (replay holds under injected failure) |
+| INV-4.2 fail-closed on malformed output | `test_malformed_executor_output_is_fail_closed` |
+| INV-5.1 recorded sub-step replayed (exactly-once) | `test_recorded_activity_is_replayed_on_retry` |
 | INV-1.1 provenance-at-write (no NULLs) | `demo.py` GUARD 2 + PROVENANCE GAPS = none |
 | INV-2.1 emitted edges monotonic | construction trace shows strictly rising `gen` |
 | INV-3.1 goal predicate gates termination | `CoverageGoal.satisfied`; `test_budget_terminates_runaway` |
 | INV-4.1 typed completion signal | `Signal` enum; scheduler branches on `result.signal` only |
 | INV-6.1 acyclic at every prefix | `demo.py` GUARD 1 rejects the back-edge |
-| INV-7.1 four termination reasons | `demo.py` (goal) + `test_budget_terminates_runaway` (cap) |
+| INV-7.1 four termination reasons | `demo.py` (goal) + `test_budget_terminates_runaway` (cap) + `test_cost_cap_enforced_within_a_wide_tick` (mid-tick budget) |
+| execute/commit ordering deterministic (§5.4, §9) | `test_batch_commit_ordering_is_deterministic`; `test_concurrent_execute_matches_serial` + `test_batch_executes_concurrently` (real parallelism, same result) |
+| recorded activity replayed / exactly-once (§5.2) | `test_recorded_activity_is_replayed_on_retry` |
+| real token→$ cost recorded (§5.3) | `test_real_cost_recorded_from_usage` |
 | SSA write-once | `test_single_assignment_write_once` |
 
 Run `python demo.py` and `python test_invariants.py`; both assert these.
@@ -390,15 +420,27 @@ Run `python demo.py` and `python test_invariants.py`; both assert these.
 
 What changes, and nothing else does:
 
-* **Batch → concurrency.** Replace the serial `for node in frontier` with
-  `asyncio.gather` or a worker pool. The ready set is already the correct
-  concurrency unit; ordering within it is semantically irrelevant.
+* **Batch → concurrency.** *Done.* The loop separates a pure **execute** phase from
+  the serial **admit**/**commit** phases (§5.4); `Scheduler(max_workers=N)` runs the
+  admitted batch's `_execute` concurrently in a thread pool (correct for sync,
+  I/O-bound executors — the GIL releases during model/network calls), capped at
+  `max_workers` (the real WIP limit). Results commit in admitted order, so the run is
+  deterministic under concurrency (`test_concurrent_execute_matches_serial`). Once
+  executors are `async def`, the pool becomes a literal `asyncio.gather`. The store's
+  `seq` remains the single serialization point.
 * **SQLite → Postgres**, in-memory projection → **Neo4j** fold. Same events, same
   guards (they sit at the store boundary).
 * **Deterministic executors → real models** at the single `Executor.run` seam.
   Wrap each model/tool/IO call as a recorded Activity so INV-5.1 still holds.
+  *Started:* `executors_ollama` provides a real retrieval SCOUT (ranks a corpus per
+  subtopic; offline lexical default, embeddings-ready) plus a real local-model ENGINEER
+  and REVIEWER (Ollama; structured output + validate/repair; every model call recorded
+  as an activity with real token→$ cost). GOAL/SYNTHESIZER stay mock. With the critic
+  real, convergence is genuine and bounded by the generation cap. Run it with
+  `python demo_ollama.py`.
 * **Idempotency keys** on external side-effecting Activities so replay/retry does
-  not double-execute the world.
+  not double-execute the world. *Done at the seam:* `Context.record(key, fn)` +
+  `ACTIVITY_RECORDED` make each recorded step exactly-once across retries (§5.2).
 * **WIP as admission control**: enforce the blackboard WIP limit as a real
   concurrency cap on `STARTED` nodes.
 * **Observability**: the graph is already the trace — expose `critical_path()`
@@ -417,7 +459,9 @@ What changes, and nothing else does:
 | `store.py` | §1.3, §1.5, §5.1 (log + provenance guard) |
 | `graph.py` | §1.1, §1.4, §6, lineage (§5, §8) |
 | `nodes.py` | §2.1, §2.3 (patch, placeholders) |
+| `activities.py` | §5.2 (recorded activities — replay/idempotency at the executor seam) |
 | `executors.py` | §3.1, §4.1–4.2, §5.3 (roles, critic loop, routing) |
+| `executors_ollama.py` | §3.1, §4.1, §5.2–5.3 (real retrieval SCOUT + Ollama ENGINEER/REVIEWER: structured output, critic loop, recorded activity, token→$ cost) |
 | `steering.py` | §3.2–3.4 (predicate, filter, beam, value) |
 | `governor.py` | §7 (bounds, retry budget) |
 | `scheduler.py` | §2.2, §5.4 (the loop) |

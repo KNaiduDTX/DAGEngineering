@@ -23,6 +23,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from .activities import ActivityRecorder
 from .core import NodeType, Signal, Tier
 from .nodes import NodeSpec, SubgraphPatch
 
@@ -30,12 +31,23 @@ from .nodes import NodeSpec, SubgraphPatch
 # --------------------------------------------------------------------------- #
 # Execution result + context                                                  #
 # --------------------------------------------------------------------------- #
+class MalformedResultError(ValueError):
+    """An executor returned something that is not a valid ExecutionResult — the
+    wrong type, an untyped signal, a non-numeric score, or a malformed patch. The
+    scheduler treats this as a FAILED attempt and never folds it into the log or
+    graph (fail-closed). The mock fleet always returns valid results, but a real
+    model will not: this is the boundary where structured-output validation and a
+    JSON-mode/repair loop attach (SPEC §9, item 2), so the messiness of a model
+    can never corrupt the substrate below it."""
+
+
 @dataclass
 class ExecutionResult:
     output: Any
     signal: Signal = Signal.CONTINUE           # TYPED completion — never parsed from text
     score: Optional[float] = None              # critic value (Layer 3)
     patch: Optional[SubgraphPatch] = None      # on-the-fly construction (Layer 2)
+    usage: Optional[dict] = None               # real token counts {input_tokens, output_tokens} (Layer 5 cost)
 
 
 @dataclass
@@ -44,6 +56,17 @@ class Context:
     goal: dict
     self_id: str          # the running node's concrete id (to reference itself in patches)
     generation: int
+    activities: Optional[ActivityRecorder] = None   # recorded-activity seam (durability)
+
+    def record(self, key: str, fn):
+        """Run `fn` as a recorded activity: called at most once per node across all
+        re-executions, its result replayed thereafter (see activities.py). Wrap every
+        nondeterministic or side-effecting step (a model call, a retrieval, an email)
+        so replay/retry never re-runs it. With no recorder bound (an executor invoked
+        outside the scheduler), it simply calls `fn`."""
+        if self.activities is None:
+            return fn()
+        return self.activities.record(key, fn)
 
 
 class Executor(ABC):
@@ -79,8 +102,29 @@ class ModelRouter:
     }
     _DEFAULT = ModelBinding("local-8b", Tier.LOCAL, 1.0)
 
+    # Real $/1M-token rates by tier (verified 2026). LOCAL has no per-token API cost;
+    # CLOUD carries a representative rate — refine to per-model rates when a cloud
+    # executor lands (e.g. opus-5 5/25, sonnet-5 3/15, haiku-4.5 1/5 per MTok).
+    _PRICING: dict[Tier, tuple[float, float]] = {
+        Tier.LOCAL: (0.0, 0.0),
+        Tier.CLOUD: (5.0, 25.0),
+    }
+
     def route(self, node_type: NodeType) -> ModelBinding:
         return self._POLICY.get(node_type, self._DEFAULT)
+
+    def cost(self, tier: Optional[str], usage: Optional[dict]) -> Optional[float]:
+        """Real dollar cost from token counts. `tier` is the recorded tier string
+        ('local'/'cloud'); `usage` is {input_tokens, output_tokens}. Returns None when
+        an executor reported no usage (e.g. a mock) — the governor's unit budget stays
+        the pre-call admission gate; this is the post-call actual, for accounting."""
+        if not usage or tier is None:
+            return None
+        rate = self._PRICING.get(Tier(tier)) if tier in (t.value for t in Tier) else None
+        if rate is None:
+            return None
+        return (usage.get("input_tokens", 0) * rate[0]
+                + usage.get("output_tokens", 0) * rate[1]) / 1_000_000
 
 
 # --------------------------------------------------------------------------- #
@@ -239,19 +283,25 @@ class ReviewerExecutor(Executor):
 
 
 class SynthesizerExecutor(Executor):
-    """Aggregator. Merges the approved draft into the terminal brief and raises
-    the GOAL signal; the scheduler then checks the goal predicate before
-    accepting termination."""
+    """Aggregator. Merges the approved draft into the terminal brief and raises the
+    GOAL signal; the scheduler then checks the goal predicate before accepting
+    termination. The terminal score is the REVIEWER's independent judgment (read from
+    the approval among its inputs), falling back to the draft's self-report for the
+    all-mock path — so a real critic drives the score without changing this node."""
     def run(self, inputs, params, ctx) -> ExecutionResult:
         draft = next(v for v in inputs.values() if isinstance(v, dict) and v.get("kind") == "draft")
+        approval = next((v for v in inputs.values()
+                         if isinstance(v, dict) and v.get("verdict") == "approve" and "score" in v),
+                        None)
+        final_score = approval["score"] if approval else draft.get("quality")
         brief = {
             "kind": "brief",
             "topic": draft["topic"],
             "covered": draft["covered"],
-            "final_score": draft["quality"],
-            "sections": {st: f"section on {st}" for st in draft["covered"]},
+            "final_score": final_score,
+            "sections": draft.get("sections") or {st: f"section on {st}" for st in draft["covered"]},
         }
-        return ExecutionResult(output=brief, signal=Signal.GOAL, score=draft["quality"])
+        return ExecutionResult(output=brief, signal=Signal.GOAL, score=final_score)
 
 
 def default_registry() -> dict[NodeType, Executor]:

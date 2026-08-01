@@ -79,6 +79,27 @@ def provenance_gaps(graph: GraphProjection) -> list[tuple[str, str]]:
     return gaps
 
 
+def cost_report(graph: GraphProjection) -> str:
+    """Real token + dollar accounting, folded from NODE_COMPLETED. Nodes whose
+    executor reported no usage (mocks) contribute only their nominal cost units."""
+    tok_in = tok_out = 0
+    usd = 0.0
+    per_tier: dict[str, float] = defaultdict(float)      # nominal units, by tier
+    for rec in graph.nodes.values():
+        if rec.tier:
+            per_tier[rec.tier] += rec.cost
+        if rec.usage:
+            tok_in += rec.usage.get("input_tokens", 0)
+            tok_out += rec.usage.get("output_tokens", 0)
+        if rec.cost_usd:
+            usd += rec.cost_usd
+    lines = ["COST + USAGE",
+             f"  nominal units by tier : {dict(per_tier)}",
+             f"  real tokens           : {tok_in} in / {tok_out} out",
+             f"  real cost             : ${usd:.6f}"]
+    return "\n".join(lines)
+
+
 def lineage_report(graph: GraphProjection) -> str:
     path = graph.critical_path()
     lines = ["CRITICAL PATH (longest dependency chain):",
