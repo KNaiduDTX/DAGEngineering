@@ -127,6 +127,7 @@ class EventType(str, Enum):
     NODE_COMPLETED = "node_completed"
     NODE_FAILED = "node_failed"
     NODE_REOPENED = "node_reopened"        # a FAILED node returned to the frontier for another attempt
+    ACTIVITY_RECORDED = "activity_recorded"  # a nondeterministic sub-step's result, recorded for replay/idempotency
     SUBGRAPH_EMITTED = "subgraph_emitted"  # lineage marker: which expander produced which patch
     NODE_PRUNED = "node_pruned"            # Layer 3 constraint filter dropped a proposed node
     GOAL_SATISFIED = "goal_satisfied"

@@ -23,6 +23,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from .activities import ActivityRecorder
 from .core import NodeType, Signal, Tier
 from .nodes import NodeSpec, SubgraphPatch
 
@@ -54,6 +55,17 @@ class Context:
     goal: dict
     self_id: str          # the running node's concrete id (to reference itself in patches)
     generation: int
+    activities: Optional[ActivityRecorder] = None   # recorded-activity seam (durability)
+
+    def record(self, key: str, fn):
+        """Run `fn` as a recorded activity: called at most once per node across all
+        re-executions, its result replayed thereafter (see activities.py). Wrap every
+        nondeterministic or side-effecting step (a model call, a retrieval, an email)
+        so replay/retry never re-runs it. With no recorder bound (an executor invoked
+        outside the scheduler), it simply calls `fn`."""
+        if self.activities is None:
+            return fn()
+        return self.activities.record(key, fn)
 
 
 class Executor(ABC):

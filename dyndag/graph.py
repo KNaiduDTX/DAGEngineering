@@ -53,6 +53,9 @@ class GraphProjection:
         self.in_edges: dict[str, set[str]] = {}
         self.terminal_node: Optional[str] = None
         self.terminated_reason: Optional[str] = None
+        # node_id -> {activity_key: recorded_result}; the replay cache that makes
+        # nondeterministic executor sub-steps exactly-once (see activities.py).
+        self.activities: dict[str, dict[str, Any]] = {}
 
     # --------------------------------------------------------------------- #
     # Folding: apply(event) is the ONLY way the projection changes           #
@@ -83,6 +86,10 @@ class GraphProjection:
             # fact (never an out-of-band mutation), so replay reconstructs the
             # same state and INV-5.2 holds even when a run ends mid-retry.
             self.nodes[e.node_id].state = NodeState.CREATED
+        elif t == EventType.ACTIVITY_RECORDED:
+            # Cache a nondeterministic sub-step's result so a re-execution of this
+            # node replays it instead of calling out again (see activities.py).
+            self.activities.setdefault(e.node_id, {})[e.payload["key"]] = e.payload["result"]
         elif t == EventType.GOAL_SATISFIED:
             self.terminal_node = e.node_id
         elif t == EventType.RUN_TERMINATED:

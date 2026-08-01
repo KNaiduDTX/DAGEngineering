@@ -55,8 +55,15 @@ views.py      blackboard (Kanban), replay verify, lineage report       L4 L5
 
 Replace the body of any `Executor.run` in `executors.py` with a model call. The
 scheduler, provenance, steering, durability, and governance layers are unchanged.
-Wrap each model/tool/IO call as a *recorded activity* (store its result as an
-event) so replay stays deterministic — see `SPEC.md` §5.2 and §9.
+Wrap each model/tool/IO call as a *recorded activity* (`ctx.record(key, fn)`, stored
+as an `ACTIVITY_RECORDED` event) so replay/retry never re-runs it — see `SPEC.md`
+§5.2 and §9.
+
+A worked example ships in `executors_ollama.py`: a real local-model ENGINEER (Ollama)
+with structured output and a validate/repair loop, everything else still mock. Run it
+with `python demo_ollama.py` (needs `pip install ollama` + a pulled model); it prints a
+skip notice if Ollama isn't reachable. The offline `demo.py` / `test_invariants.py`
+never require it.
 
 ## Design commitments (from the approved decisions)
 

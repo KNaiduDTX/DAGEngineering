@@ -212,6 +212,39 @@ def test_batch_commit_ordering_is_deterministic():
         "a scout committed before the batch finished admitting (commit not batched)"
 
 
+def test_recorded_activity_is_replayed_on_retry():
+    """A nondeterministic sub-step wrapped in ctx.record must run EXACTLY ONCE across
+    a failed attempt + retry: on the retry the recorded result is replayed, not
+    re-called. Proves idempotency (corpus items #1 and #7) offline — no model needed,
+    the 'model call' is a counter. This is the Phase 1 executor-seam durability."""
+    class _FlakyRecorder(Executor):
+        def __init__(self):
+            self.model_calls = 0
+            self.runs = 0
+
+        def _call_model(self):
+            self.model_calls += 1                 # the expensive/nondeterministic step
+            return {"material": "result"}
+
+        def run(self, inputs, params, ctx):
+            self.runs += 1
+            data = ctx.record("scout_fetch", self._call_model)   # recorded activity
+            if self.runs == 1:
+                raise RuntimeError("parse failure AFTER the recorded call, first attempt")
+            return ExecutionResult(output={"kind": "material", **data}, signal=Signal.CONTINUE)
+
+    eng = _FlakyRecorder()
+    reg = default_registry()
+    reg[NodeType.SCOUT] = eng
+    store = SQLiteEventStore(":memory:")
+    r = Scheduler(store, reg, budget=Budget(retry_budget=4)).run(dict(ONE))
+    assert eng.runs == 2, f"expected one failed attempt + one retry, got runs={eng.runs}"
+    assert eng.model_calls == 1, f"recorded step re-ran: model_calls={eng.model_calls} (idempotency broken)"
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    ok, live_h, rep_h = verify_replay(store, r.graph, r.run_id)
+    assert ok, f"replay diverged with recorded activities present: {live_h} vs {rep_h}"
+
+
 def main():
     tests = [v for k, v in globals().items() if k.startswith("test_")]
     for t in tests:

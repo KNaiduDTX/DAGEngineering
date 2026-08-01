@@ -23,9 +23,10 @@ definition of the ready set — semantically irrelevant.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
+from .activities import ActivityRecorder
 from .core import (Event, EventType, NodeType, Provenance, Signal,
                    TerminationReason, new_batch_id, new_run_id, now_iso,
                    stable_edge_id, stable_node_id)
@@ -57,6 +58,7 @@ class _Outcome:
     node_id: str
     result: Optional[ExecutionResult] = None
     error: Optional[Exception] = None
+    activities: list = field(default_factory=list)   # (key, result) recorded during execute
 
 
 class Scheduler:
@@ -202,14 +204,19 @@ class Scheduler:
         rec = self.graph.nodes[node_id]
         inputs = {p: self.graph.nodes[p].output for p in self.graph.in_edges.get(node_id, set())}
         params = resolve_placeholders(rec.params, inputs)
-        ctx = Context(run_id=run_id, goal=goal, self_id=node_id, generation=rec.generation)
+        # Read-only view of this node's already-recorded activities (from prior
+        # attempts); new steps are buffered here and committed by _commit — the
+        # execute phase performs no shared-state writes.
+        recorder = ActivityRecorder(self.graph.activities.get(node_id))
+        ctx = Context(run_id=run_id, goal=goal, self_id=node_id,
+                      generation=rec.generation, activities=recorder)
         executor = self.registry[rec.node_type]
         try:
             result = executor.run(inputs, params, ctx)
             self._validate_result(result)   # fail-closed: never act on unvalidated output
         except Exception as exc:            # executor raised OR returned garbage -> one path
-            return _Outcome(node_id=node_id, error=exc)
-        return _Outcome(node_id=node_id, result=result)
+            return _Outcome(node_id=node_id, error=exc, activities=recorder.recorded)
+        return _Outcome(node_id=node_id, result=result, activities=recorder.recorded)
 
     def _commit(self, run_id: str, outcome: _Outcome, predicate) -> Optional[dict]:
         """Serial, single-writer: fold one execution outcome into the log and graph.
@@ -219,6 +226,14 @@ class Scheduler:
         output iff this node raised GOAL and the goal predicate accepts it."""
         node_id = outcome.node_id
         rec = self.graph.nodes[node_id]
+
+        # Persist any activities recorded during execute FIRST — before the terminal
+        # event — so a step that succeeded on a failed attempt is replayed (not
+        # re-run) on the retry, and so replay reconstructs the same activity cache.
+        for key, value in outcome.activities:
+            self._emit(Event(run_id=run_id, type=EventType.ACTIVITY_RECORDED, node_id=node_id,
+                             payload={"key": key, "result": value}))
+
         if outcome.error is not None:
             return self._fail(run_id, node_id, rec, outcome.error)
 

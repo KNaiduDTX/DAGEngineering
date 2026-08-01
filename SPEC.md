@@ -113,6 +113,7 @@ Module: `graph.GraphProjection.ready_set`.
 | `NODE_COMPLETED` | `output, score, signal` | single-assignment write |
 | `NODE_FAILED` | `error, attempt` | retry accounting |
 | `NODE_REOPENED` | `attempt` | returns a FAILED node to the frontier as a *logged fact*, not a state mutation |
+| `ACTIVITY_RECORDED` | `key, result` | a nondeterministic sub-step's result, recorded for replay / exactly-once |
 | `SUBGRAPH_EMITTED` | `added_nodes` | lineage of construction |
 | `NODE_PRUNED` | `key, reason, expander_id` | constraint-filter audit |
 | `GOAL_SATISFIED` | `output` | terminal acceptance |
@@ -294,11 +295,18 @@ Everything nondeterministic (model calls, IO, timestamps, randomness) is an
 **Activity** whose *result is recorded* as an event; the orchestration loop
 consumes recorded results. This is the Temporal Workflow/Activity discipline.
 
+This is realized at the executor seam by `Context.record(key, fn)`: the first run of
+a step emits `ACTIVITY_RECORDED(key, result)`; any re-execution of the node (the
+failure-path retry, or crash recovery) **replays** the recorded result instead of
+calling `fn` again — the mechanism for exactly-once model calls and side effects. The
+recorder buffers during the pure execute phase and the serial commit phase writes the
+events, so the execute/commit boundary (§5.4) is preserved.
+
 > **INV-5.1.** No node output is recomputed on recovery; it is read from
-> `NODE_COMPLETED`.
+> `NODE_COMPLETED`. A recorded sub-step is likewise replayed, not re-run.
 > **INV-5.2.** `replay(log).structural_hash() == live.structural_hash()`.
 
-Module: `graph.GraphProjection.replay`, `views.verify_replay`.
+Module: `graph.GraphProjection.replay`, `views.verify_replay`, `activities.ActivityRecorder`.
 
 ### 5.3 Cost routing
 
@@ -392,6 +400,7 @@ Module: `governor.CostGovernor`, `scheduler.run`.
 |---|---|
 | INV-0 / INV-5.2 log is source of truth; replay identical | `demo.py` DURABILITY; `test_cross_run_determinism`; `test_reopen_survives_replay_when_run_caps_after_failure`; `test_replay_equivalence_under_random_failures` (replay holds under injected failure) |
 | INV-4.2 fail-closed on malformed output | `test_malformed_executor_output_is_fail_closed` |
+| INV-5.1 recorded sub-step replayed (exactly-once) | `test_recorded_activity_is_replayed_on_retry` |
 | INV-1.1 provenance-at-write (no NULLs) | `demo.py` GUARD 2 + PROVENANCE GAPS = none |
 | INV-2.1 emitted edges monotonic | construction trace shows strictly rising `gen` |
 | INV-3.1 goal predicate gates termination | `CoverageGoal.satisfied`; `test_budget_terminates_runaway` |
@@ -418,8 +427,12 @@ What changes, and nothing else does:
   guards (they sit at the store boundary).
 * **Deterministic executors → real models** at the single `Executor.run` seam.
   Wrap each model/tool/IO call as a recorded Activity so INV-5.1 still holds.
+  *Started:* `executors_ollama.OllamaEngineerExecutor` is a real local-model ENGINEER
+  (structured output + validate/repair) with the rest of the fleet still mock; run it
+  with `python demo_ollama.py`.
 * **Idempotency keys** on external side-effecting Activities so replay/retry does
-  not double-execute the world.
+  not double-execute the world. *Done at the seam:* `Context.record(key, fn)` +
+  `ACTIVITY_RECORDED` make each recorded step exactly-once across retries (§5.2).
 * **WIP as admission control**: enforce the blackboard WIP limit as a real
   concurrency cap on `STARTED` nodes.
 * **Observability**: the graph is already the trace — expose `critical_path()`
@@ -438,7 +451,9 @@ What changes, and nothing else does:
 | `store.py` | §1.3, §1.5, §5.1 (log + provenance guard) |
 | `graph.py` | §1.1, §1.4, §6, lineage (§5, §8) |
 | `nodes.py` | §2.1, §2.3 (patch, placeholders) |
+| `activities.py` | §5.2 (recorded activities — replay/idempotency at the executor seam) |
 | `executors.py` | §3.1, §4.1–4.2, §5.3 (roles, critic loop, routing) |
+| `executors_ollama.py` | §4.1, §5.2–5.3 (first real executor: Ollama ENGINEER, structured output, recorded activity) |
 | `steering.py` | §3.2–3.4 (predicate, filter, beam, value) |
 | `governor.py` | §7 (bounds, retry budget) |
 | `scheduler.py` | §2.2, §5.4 (the loop) |
