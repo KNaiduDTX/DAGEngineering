@@ -30,6 +30,16 @@ from .nodes import NodeSpec, SubgraphPatch
 # --------------------------------------------------------------------------- #
 # Execution result + context                                                  #
 # --------------------------------------------------------------------------- #
+class MalformedResultError(ValueError):
+    """An executor returned something that is not a valid ExecutionResult — the
+    wrong type, an untyped signal, a non-numeric score, or a malformed patch. The
+    scheduler treats this as a FAILED attempt and never folds it into the log or
+    graph (fail-closed). The mock fleet always returns valid results, but a real
+    model will not: this is the boundary where structured-output validation and a
+    JSON-mode/repair loop attach (SPEC §9, item 2), so the messiness of a model
+    can never corrupt the substrate below it."""
+
+
 @dataclass
 class ExecutionResult:
     output: Any

@@ -29,7 +29,8 @@ from typing import Optional
 from .core import (Event, EventType, NodeType, Provenance, Signal,
                    TerminationReason, new_batch_id, new_run_id, now_iso,
                    stable_edge_id, stable_node_id)
-from .executors import Context, Executor, ModelRouter
+from .executors import (Context, ExecutionResult, Executor, MalformedResultError,
+                        ModelRouter)
 from .governor import Budget, CostGovernor
 from .graph import GraphProjection
 from .nodes import NodeSpec, SubgraphPatch, resolve_placeholders
@@ -45,6 +46,17 @@ class RunResult:
     ticks: int
     graph: GraphProjection
     governor: CostGovernor
+
+
+@dataclass
+class _Outcome:
+    """Carries one node's execution from the (parallelizable) execute phase to the
+    (serial, single-writer) commit phase. Holding the result as plain data is what
+    lets the execute phase avoid touching shared state, so Phase 2 can run the whole
+    batch under asyncio.gather while admit/commit stay serial (see Scheduler.run)."""
+    node_id: str
+    result: Optional[ExecutionResult] = None
+    error: Optional[Exception] = None
 
 
 class Scheduler:
@@ -163,9 +175,18 @@ class Scheduler:
         return created
 
     # --------------------------------------------------------------------- #
-    # dispatch one node                                                       #
+    # one node, in three phases: admit -> execute -> commit                   #
+    #                                                                         #
+    # The batch (the ready set) is dataflow-independent but NOT side-effect-  #
+    # independent: admit and commit both touch shared state (governor, graph, #
+    # store). So they run serially and are the single-writer serialization    #
+    # point; only execute is pure and parallelizable. Phase 2 swaps the       #
+    # execute loop for asyncio.gather and nothing else changes.               #
     # --------------------------------------------------------------------- #
-    def _dispatch(self, run_id: str, node_id: str, goal: dict) -> Optional[dict]:
+    def _admit(self, run_id: str, node_id: str) -> None:
+        """Serial, single-writer: route the node, charge its cost, record NODE_STARTED.
+        Admission is where cost is spent, so it is where the cost cap is enforced
+        (the caller checks the governor before admitting each node)."""
         rec = self.graph.nodes[node_id]
         binding = self.router.route(rec.node_type)
         self.governor.charge(binding.cost)
@@ -173,36 +194,101 @@ class Scheduler:
                          payload={"tier": binding.tier.value, "model": binding.name,
                                   "cost": binding.cost}))
 
+    def _execute(self, run_id: str, node_id: str, goal: dict) -> _Outcome:
+        """Pure execution: read inputs, run the bound executor, validate the result.
+        Touches NO shared state (no log append, no projection mutation, no governor),
+        so a whole batch of _execute calls is safe to run concurrently. Returns the
+        result (or the failure) as data for the serial commit phase."""
+        rec = self.graph.nodes[node_id]
         inputs = {p: self.graph.nodes[p].output for p in self.graph.in_edges.get(node_id, set())}
         params = resolve_placeholders(rec.params, inputs)
         ctx = Context(run_id=run_id, goal=goal, self_id=node_id, generation=rec.generation)
         executor = self.registry[rec.node_type]
-
         try:
             result = executor.run(inputs, params, ctx)
-        except Exception as exc:  # retry against the GLOBAL budget
-            self._emit(Event(run_id=run_id, type=EventType.NODE_FAILED, node_id=node_id,
-                             payload={"error": repr(exc), "attempt": rec.attempts}))
-            if self.governor.spend_retry():
-                self._reopen(run_id, node_id)          # allow one more dispatch
-            return None
+            self._validate_result(result)   # fail-closed: never act on unvalidated output
+        except Exception as exc:            # executor raised OR returned garbage -> one path
+            return _Outcome(node_id=node_id, error=exc)
+        return _Outcome(node_id=node_id, result=result)
 
+    def _commit(self, run_id: str, outcome: _Outcome, predicate) -> Optional[dict]:
+        """Serial, single-writer: fold one execution outcome into the log and graph.
+        A failure becomes NODE_FAILED (+ retry/reopen); a success becomes
+        NODE_COMPLETED (+ any emitted subgraph). Committing in a fixed order keeps
+        the batch's event sequence deterministic and replayable. Returns the terminal
+        output iff this node raised GOAL and the goal predicate accepts it."""
+        node_id = outcome.node_id
+        rec = self.graph.nodes[node_id]
+        if outcome.error is not None:
+            return self._fail(run_id, node_id, rec, outcome.error)
+
+        result = outcome.result
         self._emit(Event(run_id=run_id, type=EventType.NODE_COMPLETED, node_id=node_id,
                          payload={"output": result.output, "score": result.score,
                                   "signal": result.signal.value}))
-
         if result.patch is not None:
             self._apply_patch(run_id, node_id, result.patch)
 
-        if result.signal == Signal.GOAL:
-            return result.output   # candidate terminal; caller checks the predicate
+        if result.signal == Signal.GOAL and predicate.satisfied(result.output):
+            self._emit(Event(run_id=run_id, type=EventType.GOAL_SATISFIED,
+                             node_id=node_id, payload={"output": result.output}))
+            return result.output   # accepted terminal (INV-3.1: predicate gated)
         return None
 
+    def _fail(self, run_id: str, node_id: str, rec, exc: Exception) -> None:
+        """Record a failed attempt and, if the GLOBAL retry budget allows, reopen
+        the node for one more dispatch. Both a raised executor and a malformed
+        result land here, so the scheduler has exactly one failure path."""
+        self._emit(Event(run_id=run_id, type=EventType.NODE_FAILED, node_id=node_id,
+                         payload={"error": repr(exc), "attempt": rec.attempts}))
+        if self.governor.spend_retry():
+            self._reopen(run_id, node_id)
+        return None
+
+    def _validate_result(self, result) -> None:
+        """Fail-closed check on executor output BEFORE it can touch the log or the
+        graph. The completion signal is what the scheduler branches on (INV-4.1),
+        so its shape is load-bearing: a real model that returns the wrong type, an
+        untyped signal, or a bad patch is handled as a failed attempt, never
+        folded in. This is where a JSON-mode / schema-validate / repair loop
+        attaches when real executors arrive (SPEC §9)."""
+        if not isinstance(result, ExecutionResult):
+            raise MalformedResultError(
+                f"executor returned {type(result).__name__}, not ExecutionResult")
+        if not isinstance(result.signal, Signal):
+            raise MalformedResultError(f"signal {result.signal!r} is not a typed Signal")
+        if result.score is not None and not isinstance(result.score, (int, float)):
+            raise MalformedResultError(f"score {result.score!r} is neither numeric nor None")
+        if result.patch is not None:
+            self._validate_patch(result.patch)
+
+    def _validate_patch(self, patch) -> None:
+        """A patch is the sole construction primitive; a malformed one would strand
+        or corrupt the graph, so it is validated structurally before instantiation."""
+        if not isinstance(patch, SubgraphPatch):
+            raise MalformedResultError(f"patch is {type(patch).__name__}, not SubgraphPatch")
+        for spec in patch.added_nodes:
+            if not isinstance(spec, NodeSpec):
+                raise MalformedResultError(f"patch node is {type(spec).__name__}, not NodeSpec")
+            if not isinstance(spec.node_type, NodeType):
+                raise MalformedResultError(
+                    f"node {spec.key!r} has non-typed node_type {spec.node_type!r}")
+            if spec.node_type not in self.registry:
+                raise MalformedResultError(
+                    f"node {spec.key!r} type {spec.node_type.value} has no bound executor")
+        for edge in patch.added_edges:
+            if not (isinstance(edge, (tuple, list)) and len(edge) == 2):
+                raise MalformedResultError(f"malformed edge {edge!r}")
+
     def _reopen(self, run_id: str, node_id: str) -> None:
-        """Reset a failed node to CREATED so the frontier will retry it. Recorded
-        as a completion-less state transition via a NODE_CREATED-free path: we
-        simply flip the projection state; the retry emits a fresh NODE_STARTED."""
-        self.graph.nodes[node_id].state = self.graph.nodes[node_id].state.CREATED
+        """Return a FAILED node to the frontier for another attempt — as a RECORDED
+        fact (NODE_REOPENED), never an out-of-band mutation. The projection is a
+        pure fold over the log (INV-0); if the reopen weren't itself an event, a
+        replay would reconstruct the node as FAILED and diverge from the live graph
+        whenever the run ends before the retry runs (INV-5.2). The fold resets the
+        state to CREATED; the retry then emits a fresh NODE_STARTED."""
+        self._emit(Event(run_id=run_id, type=EventType.NODE_REOPENED, node_id=node_id,
+                         payload={"attempt": self.graph.nodes[node_id].attempts}))
 
     # --------------------------------------------------------------------- #
     # the run                                                                 #
@@ -239,17 +325,32 @@ class Scheduler:
                 from .steering import beam_prune
                 frontier, _dropped = beam_prune(self.graph, frontier, self.beam_width)
 
-            done = False
+            # ADMIT (serial, single-writer). Cost is spent here, so the cap is
+            # enforced here as it accrues: a wide batch cannot overshoot
+            # max_total_cost by more than one node before admission stops (C).
+            admitted: list[str] = []
             for node_id in frontier:                       # batch = parallel unit
-                candidate = self._dispatch(run_id, node_id, goal)
-                if candidate is not None and predicate.satisfied(candidate):
-                    self._emit(Event(run_id=run_id, type=EventType.GOAL_SATISFIED,
-                                     node_id=node_id, payload={"output": candidate}))
+                over = self.governor.check(self.graph, generation)
+                if over is not None:
+                    reason = over
+                    break
+                self._admit(run_id, node_id)
+                admitted.append(node_id)
+
+            # EXECUTE (pure). This is the seam Phase 2 runs under asyncio.gather;
+            # serially for now, but nothing else in the loop needs to change (D).
+            outcomes = [self._execute(run_id, node_id, goal) for node_id in admitted]
+
+            # COMMIT (serial, single-writer, deterministic order). A satisfied goal
+            # takes precedence over a cost bound tripped during admission.
+            for outcome in outcomes:
+                candidate = self._commit(run_id, outcome, predicate)
+                if candidate is not None:
                     terminal_output = candidate
                     reason = TerminationReason.GOAL_SATISFIED
-                    done = True
                     break
-            if done:
+
+            if reason is not None:
                 break
 
             generation += 1

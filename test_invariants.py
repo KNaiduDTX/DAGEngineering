@@ -4,18 +4,52 @@ test_invariants.py — small, dependency-free checks of the load-bearing guarant
 Run:  python test_invariants.py
 """
 
-from dyndag import (Budget, GraphProjection, NodeType, Provenance, Scheduler,
-                    SQLiteEventStore, default_registry)
+import random
+
+from dyndag import (Budget, ExecutionResult, Executor, GraphProjection, NodeType,
+                    Provenance, Scheduler, Signal, SQLiteEventStore, SubgraphPatch,
+                    TerminationReason, default_registry, verify_replay)
 from dyndag.core import Event, EventType, now_iso
 from dyndag.graph import SingleAssignmentError
 from dyndag.steering import beam_prune
 
 
 GOAL = {"topic": "t", "subtopics": ["a", "b"], "target_score": 0.80}
+ONE = {"topic": "t", "subtopics": ["a"], "target_score": 0.80}  # smallest goal
 
 
 def _fresh():
     return Scheduler(SQLiteEventStore(":memory:"), default_registry(), budget=Budget())
+
+
+# --------------------------------------------------------------------------- #
+# Failure injection — the deterministic mock fleet never raises, so these      #
+# wrappers drive the NODE_FAILED -> retry -> reopen path that the substrate    #
+# must survive (durability under failure is the whole point of event sourcing).#
+# --------------------------------------------------------------------------- #
+class _Flaky(Executor):
+    """Wraps an executor and raises on its first `fail_times` invocations, then
+    delegates to the real one. `fail_times` large => always fails."""
+    def __init__(self, inner: Executor, fail_times: int):
+        self.inner = inner
+        self.fail_times = fail_times
+
+    def run(self, inputs, params, ctx):
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise RuntimeError("injected transient failure")
+        return self.inner.run(inputs, params, ctx)
+
+
+class _RandomFlaky(Executor):
+    """Raises with probability `p` on each call (seeded RNG => reproducible)."""
+    def __init__(self, inner: Executor, rng: random.Random, p: float):
+        self.inner, self.rng, self.p = inner, rng, p
+
+    def run(self, inputs, params, ctx):
+        if self.rng.random() < self.p:
+            raise RuntimeError("injected random failure")
+        return self.inner.run(inputs, params, ctx)
 
 
 def test_single_assignment_write_once():
@@ -65,6 +99,117 @@ def test_budget_terminates_runaway():
                   budget=Budget(max_generation=2))  # too small to reach the goal
     r = s.run(dict(GOAL))
     assert r.reason.value in ("generation_cap", "no_progress"), r.reason.value
+
+
+def test_reopen_survives_replay_when_run_caps_after_failure():
+    """The adversarial durability case: a node fails and is REOPENED, then the run
+    hits a cap before the retry runs — leaving it CREATED in the live graph. If the
+    reopen is an out-of-band state mutation instead of a logged fact, replay folds
+    the log back to FAILED and the projections diverge (INV-5.2 broken). This test
+    fails on a scheduler that reopens without an event."""
+    reg = default_registry()
+    reg[NodeType.SCOUT] = _Flaky(reg[NodeType.SCOUT], fail_times=99)  # always fails
+    store = SQLiteEventStore(":memory:")
+    s = Scheduler(store, reg, budget=Budget(max_generation=2, retry_budget=1))
+    r = s.run(dict(ONE))
+    assert s.governor.retries_used >= 1, "the reopen path was never exercised"
+    ok, live_h, rep_h = verify_replay(store, r.graph, r.run_id)
+    assert ok, f"replay diverged after a stranded reopen: live={live_h} replay={rep_h}"
+
+
+def test_success_after_retry_reaches_goal_and_replays():
+    """The happy failure case: a transient error that succeeds on retry must not
+    perturb the outcome — the goal is still reached and the log still replays
+    bit-identically."""
+    reg = default_registry()
+    reg[NodeType.SCOUT] = _Flaky(reg[NodeType.SCOUT], fail_times=1)  # one transient error
+    store = SQLiteEventStore(":memory:")
+    s = Scheduler(store, reg, budget=Budget(retry_budget=4))
+    r = s.run(dict(GOAL))
+    assert s.governor.retries_used >= 1
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok, "replay diverged after a successful retry"
+
+
+def test_malformed_executor_output_is_fail_closed():
+    """A real model will eventually return garbage. The scheduler must treat a
+    malformed ExecutionResult as a failed attempt and NEVER fold it into the log
+    or graph — and it must not crash the orchestrator doing so."""
+    class _Garbage(Executor):
+        def run(self, inputs, params, ctx):
+            return "not an ExecutionResult"
+
+    reg = default_registry()
+    reg[NodeType.SCOUT] = _Garbage()
+    store = SQLiteEventStore(":memory:")
+    s = Scheduler(store, reg, budget=Budget(retry_budget=2))
+    r = s.run(dict(ONE))                       # must return, not raise
+    completed = [e for e in store.read(r.run_id)
+                 if e.type == EventType.NODE_COMPLETED and (e.node_id or "").startswith("scout")]
+    assert not completed, "scheduler folded unvalidated output into the log"
+    assert s.governor.retries_used >= 1, "malformed output was not handled as a failed attempt"
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
+
+
+def test_replay_equivalence_under_random_failures():
+    """Property sweep: across many seeded random failure schedules, replaying the
+    log ALWAYS reconstructs the live projection (INV-5.2) and the run ALWAYS ends
+    with one of the four reasons (INV-7.1). Stdlib RNG keeps it deterministic and
+    dependency-free; a Hypothesis port is a later upgrade."""
+    four = {TerminationReason.GOAL_SATISFIED, TerminationReason.GENERATION_CAP,
+            TerminationReason.BUDGET_EXHAUSTED, TerminationReason.NO_PROGRESS}
+    seen = set()
+    for seed in range(40):
+        rng = random.Random(seed)
+        reg = default_registry()
+        for nt in list(reg):
+            reg[nt] = _RandomFlaky(reg[nt], rng, p=0.35)
+        store = SQLiteEventStore(":memory:")
+        s = Scheduler(store, reg, budget=Budget(retry_budget=6, max_generation=12))
+        r = s.run(dict(GOAL))
+        ok, live_h, rep_h = verify_replay(store, r.graph, r.run_id)
+        assert ok, f"seed {seed}: replay diverged live={live_h} replay={rep_h}"
+        assert r.reason in four, f"seed {seed}: undefined termination {r.reason}"
+        seen.add(r.reason)
+    assert seen, "sweep executed no runs"
+
+
+def test_cost_cap_enforced_within_a_wide_tick():
+    """Finding C: max_total_cost must bound spend as it accrues *within* a tick,
+    not only at the next top-of-loop check. With a wide scout frontier and a cap
+    below the full batch cost, admission halts mid-batch — total overshoot is
+    bounded by one node's cost, not the whole batch."""
+    goal = {"topic": "t", "subtopics": [f"s{i}" for i in range(20)], "target_score": 0.80}
+    store = SQLiteEventStore(":memory:")
+    s = Scheduler(store, default_registry(), budget=Budget(max_total_cost=10.0))
+    r = s.run(goal)
+    assert r.reason == TerminationReason.BUDGET_EXHAUSTED, r.reason
+    # 20 scouts @1 (after orchestrator @5) would reach 25; mid-tick enforcement
+    # stops admission shortly after 10, bounded by the most expensive single node.
+    assert s.governor.total_cost <= 10.0 + 5.0, s.governor.total_cost
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
+
+
+def test_batch_commit_ordering_is_deterministic():
+    """Finding D: the execute/commit split must keep a deterministic, single-writer
+    commit. Two runs produce an identical event sequence, and every NODE_STARTED in
+    the scout batch precedes every NODE_COMPLETED in it (the whole batch is admitted
+    before any of it commits — the ordering Phase 2's asyncio.gather relies on)."""
+    def seq():
+        store = SQLiteEventStore(":memory:")
+        r = Scheduler(store, default_registry(), budget=Budget()).run(dict(GOAL))
+        return [(e.type.value, e.node_id) for e in store.read(r.run_id)]
+    s1, s2 = seq(), seq()
+    assert s1 == s2, "event sequence is not deterministic across runs"
+    starts = [i for i, (t, n) in enumerate(s1)
+              if t == "node_started" and (n or "").startswith("scout")]
+    comps = [i for i, (t, n) in enumerate(s1)
+             if t == "node_completed" and (n or "").startswith("scout")]
+    assert starts and comps and max(starts) < min(comps), \
+        "a scout committed before the batch finished admitting (commit not batched)"
 
 
 def main():

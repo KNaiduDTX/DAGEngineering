@@ -112,6 +112,7 @@ Module: `graph.GraphProjection.ready_set`.
 | `NODE_STARTED` | `tier, model, cost` | dispatch + cost, stamps `started_at` |
 | `NODE_COMPLETED` | `output, score, signal` | single-assignment write |
 | `NODE_FAILED` | `error, attempt` | retry accounting |
+| `NODE_REOPENED` | `attempt` | returns a FAILED node to the frontier as a *logged fact*, not a state mutation |
 | `SUBGRAPH_EMITTED` | `added_nodes` | lineage of construction |
 | `NODE_PRUNED` | `key, reason, expander_id` | constraint-filter audit |
 | `GOAL_SATISFIED` | `output` | terminal acceptance |
@@ -232,8 +233,14 @@ token parsed from `output`.
 > **INV-4.1.** Node completion is a typed `ExecutionResult.signal`, and the
 > scheduler branches only on it. The 'agent emitted `<complete>` as a literal
 > string' failure class is unrepresentable.
+> **INV-4.2 (fail-closed).** A result that is not a well-formed `ExecutionResult`
+> — wrong type, an untyped `signal`, a non-numeric `score`, or a malformed patch —
+> is rejected *at the dispatch boundary* and handled as a failed attempt; the
+> scheduler never folds unvalidated output into the log or graph. This is the seam
+> where a real model's structured-output validation + repair loop attaches (§9).
 
-Module: `executors.Executor`, `executors.ExecutionResult`.
+Module: `executors.Executor`, `executors.ExecutionResult`,
+`executors.MalformedResultError`, enforced in `scheduler._validate_result`.
 
 ### 4.2 Roles are types, not personalities
 
@@ -311,15 +318,25 @@ loop:
     frontier = ready_set()                     # the parallel batch
     if frontier == ∅: terminate(NO_PROGRESS)   # deadlock/starvation guard
     frontier = beam_prune(frontier)            # optional
-    for node in frontier:                       # concurrency unit in prod
-        route + charge + NODE_STARTED
-        inputs = producer outputs; resolve placeholders
-        result = executor.run(...)   # on exception: spend global retry, reopen
-        NODE_COMPLETED(output, score, signal)
-        if result.patch: apply_patch()          # §2.2
-        if signal == GOAL and predicate(output): GOAL_SATISFIED; terminate
+
+    admit:   for node in frontier:             # SERIAL, single-writer
+                 if governor.check(): break     # cost cap enforced as it accrues
+                 route + charge + NODE_STARTED
+    execute: outcomes = [run(node) for node in admitted]   # PURE; Phase 2: asyncio.gather
+                 # each run(): resolve inputs, executor.run(...), validate(result)
+                 # raised OR malformed -> carried as a failure outcome
+    commit:  for outcome in outcomes:          # SERIAL, single-writer, deterministic
+                 if outcome.failed: NODE_FAILED; spend global retry; NODE_REOPENED (logged)
+                 else: NODE_COMPLETED(output, score, signal); if patch: apply_patch()  # §2.2
+                       if signal == GOAL and predicate(output): GOAL_SATISFIED; terminate
+
     generation += 1; if > cap: terminate(GENERATION_CAP)
 ```
+
+The batch is dataflow-independent but not side-effect-independent, so **admit** and
+**commit** (which touch the governor, graph, and store) stay serial and are the
+single-writer serialization point; only **execute** is pure. This is the
+execute-parallel / commit-serially boundary Phase 2 parallelizes (§9).
 
 ---
 
@@ -373,13 +390,15 @@ Module: `governor.CostGovernor`, `scheduler.run`.
 
 | Invariant | Proof in code |
 |---|---|
-| INV-0 / INV-5.2 log is source of truth; replay identical | `demo.py` DURABILITY; `test_cross_run_determinism` |
+| INV-0 / INV-5.2 log is source of truth; replay identical | `demo.py` DURABILITY; `test_cross_run_determinism`; `test_reopen_survives_replay_when_run_caps_after_failure`; `test_replay_equivalence_under_random_failures` (replay holds under injected failure) |
+| INV-4.2 fail-closed on malformed output | `test_malformed_executor_output_is_fail_closed` |
 | INV-1.1 provenance-at-write (no NULLs) | `demo.py` GUARD 2 + PROVENANCE GAPS = none |
 | INV-2.1 emitted edges monotonic | construction trace shows strictly rising `gen` |
 | INV-3.1 goal predicate gates termination | `CoverageGoal.satisfied`; `test_budget_terminates_runaway` |
 | INV-4.1 typed completion signal | `Signal` enum; scheduler branches on `result.signal` only |
 | INV-6.1 acyclic at every prefix | `demo.py` GUARD 1 rejects the back-edge |
-| INV-7.1 four termination reasons | `demo.py` (goal) + `test_budget_terminates_runaway` (cap) |
+| INV-7.1 four termination reasons | `demo.py` (goal) + `test_budget_terminates_runaway` (cap) + `test_cost_cap_enforced_within_a_wide_tick` (mid-tick budget) |
+| execute/commit ordering deterministic (§5.4, §9) | `test_batch_commit_ordering_is_deterministic` |
 | SSA write-once | `test_single_assignment_write_once` |
 
 Run `python demo.py` and `python test_invariants.py`; both assert these.
@@ -390,9 +409,11 @@ Run `python demo.py` and `python test_invariants.py`; both assert these.
 
 What changes, and nothing else does:
 
-* **Batch → concurrency.** Replace the serial `for node in frontier` with
-  `asyncio.gather` or a worker pool. The ready set is already the correct
-  concurrency unit; ordering within it is semantically irrelevant.
+* **Batch → concurrency.** The loop already separates a pure **execute** phase
+  from the serial **admit**/**commit** phases (§5.4), so concurrency is: replace
+  `outcomes = [execute(n) for n in admitted]` with `asyncio.gather`. The ready
+  set is the concurrency unit; ordering within it is semantically irrelevant, and
+  the store's `seq` remains the single serialization point.
 * **SQLite → Postgres**, in-memory projection → **Neo4j** fold. Same events, same
   guards (they sit at the store boundary).
 * **Deterministic executors → real models** at the single `Executor.run` seam.

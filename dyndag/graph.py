@@ -78,6 +78,11 @@ class GraphProjection:
             n.score = e.payload.get("score")
         elif t == EventType.NODE_FAILED:
             self.nodes[e.node_id].state = NodeState.FAILED
+        elif t == EventType.NODE_REOPENED:
+            # Return a FAILED node to the frontier. This is folded from a LOGGED
+            # fact (never an out-of-band mutation), so replay reconstructs the
+            # same state and INV-5.2 holds even when a run ends mid-retry.
+            self.nodes[e.node_id].state = NodeState.CREATED
         elif t == EventType.GOAL_SATISFIED:
             self.terminal_node = e.node_id
         elif t == EventType.RUN_TERMINATED:
