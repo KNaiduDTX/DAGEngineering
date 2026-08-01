@@ -21,6 +21,8 @@ from .governor import Budget, CostGovernor
 from .scheduler import Scheduler, RunResult
 from .views import (render_blackboard, verify_replay, lineage_report,
                     provenance_gaps, cost_report)
+from .evaluation import (EvalTask, TaskResult, DEFAULT_TASKS, run_task, run_eval,
+                         cost_routing_report, savings_pct)
 
 __all__ = [
     "Scheduler", "RunResult", "SQLiteEventStore", "EventStore", "GraphProjection",
@@ -35,4 +37,6 @@ __all__ = [
     "TerminationReason", "Provenance", "Event", "EventType",
     "render_blackboard", "verify_replay", "lineage_report", "provenance_gaps",
     "cost_report",
+    "EvalTask", "TaskResult", "DEFAULT_TASKS", "run_task", "run_eval",
+    "cost_routing_report", "savings_pct",
 ]

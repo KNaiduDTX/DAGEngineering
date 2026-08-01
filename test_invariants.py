@@ -401,6 +401,21 @@ def _or_completion(content, cost=None, finish="stop", refusal=None):
     return {"choices": [{"message": msg, "finish_reason": finish}], "usage": usage}
 
 
+def _fleet_transport(cost):
+    """A fake transport serving valid plan/draft/review for any task at a fixed per-call
+    cost (the orchestrator post-fills required subtopics, so plan can return no scouts)."""
+    def _t(model, messages, response_format):
+        name = (response_format or {}).get("json_schema", {}).get("name", "")
+        if name == "plan":
+            content = json.dumps({"scouts": [], "engineer_brief": "b", "review_rubric": "r"})
+        elif name == "draft":
+            content = json.dumps({"covered": ["x"], "sections": [{"subtopic": "x", "text": "t"}]})
+        else:  # review
+            content = json.dumps({"score": 0.95, "critique": "ok"})
+        return _or_completion(content, cost=cost)
+    return _t
+
+
 def test_openrouter_executors_run_and_record_provider_cost():
     """The OpenRouter (OpenAI-compatible) ENGINEER + REVIEWER run end-to-end through an
     injected fake transport (no network, no key), and the dollar cost recorded is the
@@ -497,6 +512,40 @@ def test_openrouter_orchestrator_plans_and_guarantees_coverage():
     assert "plan" in r.graph.activities.get(orch.node_id, {}), "plan not recorded as an activity"
     ok, _, _ = verify_replay(store, r.graph, r.run_id)
     assert ok
+
+
+def test_eval_harness_ranks_policies_by_cost():
+    """The cost-routing harness runs a task under two policies (fake cloud transports at
+    different per-call cost), both succeed, and the report + savings_pct show the cheaper
+    policy costs proportionally less — the mechanics of the cost-routing claim, offline."""
+    from dyndag import (EvalTask, cost_routing_report, openrouter_registry, run_eval,
+                        savings_pct)
+
+    task = EvalTask("t", {"topic": "t", "subtopics": ["a", "b"], "target_score": 0.80})
+    policies = {
+        "cheap": lambda: openrouter_registry(transport=_fleet_transport(0.001)),
+        "dear": lambda: openrouter_registry(transport=_fleet_transport(0.010)),
+    }
+    results = run_eval([task], policies)
+    assert results["cheap"]["t"].success and results["dear"]["t"].success
+    assert results["cheap"]["t"].cost_usd < results["dear"]["t"].cost_usd
+    assert results["cheap"]["t"].cost_usd > 0                      # provider cost flowed through
+    pct = savings_pct(results, "cheap", "dear")
+    assert pct is not None and 85.0 <= pct <= 95.0, pct            # 10x cheaper -> ~90%
+    rep = cost_routing_report(results)
+    assert "cheap" in rep and "less than" in rep, rep
+
+
+def test_eval_runs_mock_registry_offline():
+    """The harness runs any registry: the all-mock fleet reaches the goal at zero
+    recorded dollar cost (mocks report no usage)."""
+    from dyndag import EvalTask, run_eval
+
+    task = EvalTask("m", {"topic": "t", "subtopics": ["a"], "target_score": 0.80})
+    results = run_eval([task], {"mock": lambda: default_registry()})
+    tr = results["mock"]["m"]
+    assert tr.success and tr.reason == "goal_satisfied", (tr.success, tr.reason)
+    assert tr.cost_usd == 0.0, tr.cost_usd
 
 
 def main():
