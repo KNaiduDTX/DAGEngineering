@@ -86,6 +86,7 @@ class NodeType(str, Enum):
     ENGINEER = "engineer"         # generation / refinement — produces & improves content
     REVIEWER = "reviewer"         # critic — produces the error signal (Layer 3)
     SYNTHESIZER = "synthesizer"   # aggregator — converges branches to one outcome
+    PHI = "phi"                   # φ-merge — selects/combines COMPETING branches, records the selector
     TESTER = "tester"             # critic variant
     HARDENER = "hardener"         # terminal quality gate
     OPS = "ops"                   # terminal quality gate
