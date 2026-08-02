@@ -128,4 +128,15 @@ only parallelizable phase; admit and commit stay serial and single-writer (the s
 
 See `SPEC.md` for the full contracts, schemas, invariants, and the PoC→prod delta.
 
+## License
+
+Copyright (c) 2026 Karthik Naidu and Associated Researchers. All rights reserved.
+
+This software is proprietary. Plutus CCE LLC is granted a non-exclusive,
+non-transferable, non-sublicensable, limited license for internal use only,
+subject to the terms and conditions in the [LICENSE](LICENSE) file.
+
+All intellectual property rights are retained by Karthik Naidu and the
+Associated Researchers listed as contributors to this project. For
+licensing inquiries, contact: karthik.naidu.east@gmail.com.
 
