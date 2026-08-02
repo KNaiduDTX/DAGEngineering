@@ -31,7 +31,7 @@ concurrency are done and merged; persistence is the remaining phase.
 | **0 — Harden substrate** | ✅ done | failure-path durability, fail-closed dispatch, mid-tick cost cap, execute/commit boundary; failure-injection + property sweeps |
 | **1 — Executor seam** | ✅ done | recorded-activity + idempotency; structured output + validate→repair; 4 real role-types (SCOUT/ORCHESTRATOR/ENGINEER/REVIEWER) across local + cloud; error taxonomy; real token→$ cost; cost-routing eval |
 | **2 — Concurrency** | ✅ done | parallel execute batch (thread pool + literal `asyncio.gather`); distributed workers pulling the frontier; backpressure |
-| **Eval — GSM8K** | ✅ done | three arms — single-pass, SSA-generational, self-consistency (φ-merge) — reporting accuracy, \$/correct, generation counts, wall-clock, and replay-during-eval (via an injectable goal predicate) |
+| **Eval — GSM8K** | ✅ done | four ablation arms — single-pass, SSA (refine), self-consistency (φ-merge), combined (φ-of-SSA) — reporting accuracy, \$/correct, generations, wall-clock, replay-during-eval, and a paired McNemar analysis (via an injectable goal predicate) |
 | **3 — Persistence** | 🔴 next | Postgres `EventStore` adapter, snapshotting, resume-from-log (the `EventStore` ABC + recorded activities already lay the foundation) |
 
 ## What the demo shows (one run)
@@ -71,8 +71,8 @@ executors_ollama.py     native-Ollama chat: format= transport + registry       L
 executors_openrouter.py OpenAI-compatible chat: urllib transport, refusal+cost L4 L5
 phi.py                  φ-merge of competing branches: argmax / majority /     L4 L6
                         union policies; PhiExecutor records the selector
-tasks_gsm8k.py          GSM8K task: solver/checker/answer + single/ssa/sc      L3
-                        registries, JSONL loader + exact-match judge
+tasks_gsm8k.py          GSM8K task: solver/critic/answer roles; single/ssa/    L3
+                        sc/combined registries; JSONL loader + exact-match judge
 steering.py             pluggable goal predicate, constraint filter, beam      L3
 governor.py             caps + GLOBAL retry budget                             L7
 scheduler.py            the loop: admit→execute→commit; batch / async /        L5
@@ -114,26 +114,33 @@ offline `demo.py` / `test_invariants.py` never require any.
 
 The substrate pointed at a standard benchmark (`tasks_gsm8k.py`): grade-school math word
 problems, graded by exact match on the final number. SOLVER / CHECKER / ANSWER roles run over
-the same provider-agnostic `chat`, in three configurations:
+the same provider-agnostic `chat`, in four configurations that **ablate the two construction
+primitives** — refinement (SSA) and merge (φ):
 
-* **single-pass** — one solver, no critic.
-* **SSA-generational** — a CHECKER verifies the reasoning and, when unconvinced, emits a
-  *new generation* solver (`solver.g{k+1}`) fed the critique — iteration without a cycle.
-* **self-consistency** — K solvers sample competing reasoning paths in parallel; a **φ-node**
-  (`phi.py`) majority-votes their answers into one, recording the tally as the merge's
-  provenance. This is the φ-merge of competing branches, made concrete.
+* **single-pass** — neither. One solver, no critic.
+* **SSA-generational** — *refinement only*. A CHECKER verifies the reasoning and, when
+  unconvinced, emits a *new generation* solver (`solver.g{k+1}`) fed the critique — iteration
+  without a cycle.
+* **self-consistency** — *merge only*. K solvers sample competing reasoning paths in parallel;
+  a **φ-node** (`phi.py`) majority-votes their answers into one, recording the tally as the
+  merge's provenance.
+* **combined (φ-of-SSA)** — *both*. K competing lineages, each refined (solver → critic →
+  refined solver), then φ-merged — the arm that tests the **compositional** claim (refine each
+  line *and* take consensus). (Refinement here is fixed-depth: the substrate builds statically,
+  so a φ can't grow its fan-in over adaptively-deep lineages — a real limitation, see `SPEC.md`.)
 
-`eval_gsm8k.py` reports the five numbers the paper is built around: **accuracy** (does SSA
-iteration help?), **\$ per correct answer** (the cost/quality frontier), mean **generations**
-(the SSA-specific metric), mean **wall-clock** (latency under concurrency), and
-**replay-equivalence** holding live during the eval — the last even under temperature-sampled
-self-consistency, because every sample is a recorded activity. The DAG never sees the gold
-answer — the goal predicate (`AnswerGoal`) only certifies that *an* answer survived the critic
-or merge; correctness lives in the eval judge alone, so the graph can't cheat toward termination.
+`eval_gsm8k.py` reports the five numbers the paper is built around — **accuracy**, **\$ per
+correct answer** (the cost/quality frontier), mean **generations**, mean **wall-clock** (latency
+under concurrency), and **replay-equivalence** holding live during the eval (even under
+temperature-sampled self-consistency, because every sample is a recorded activity) — plus a
+**paired McNemar** analysis over the *same* problems (the right test when every config runs the
+identical task set: it exposes strict domination and whether a small accuracy gap is just noise).
+The DAG never sees the gold answer — the goal predicate (`AnswerGoal`) only certifies that *an*
+answer survived the critic or merge; correctness lives in the eval judge alone.
 
 ```bash
 curl -sL https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl -o test.jsonl
-python eval_gsm8k.py --data test.jsonl --n 250 --configs single,ssa,sc --k 5
+python eval_gsm8k.py --data test.jsonl --n 250 --configs single,ssa,sc,combined --k 5 --dump results.json
 ```
 
 Provider is auto-detected (Ollama or `OPENROUTER_API_KEY`) and skips cleanly when absent; with

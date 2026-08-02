@@ -424,6 +424,7 @@ Module: `governor.CostGovernor`, `scheduler.run`.
 | cost-routing eval measures success vs cost (§9) | `test_eval_harness_ranks_policies_by_cost`; `test_eval_runs_mock_registry_offline` |
 | GSM8K eval: SSA iteration lifts accuracy; metrics + replay (§9) | `test_gsm8k_ssa_helps_vs_singlepass`; `test_gsm8k_eval_metrics_surface`; `test_gsm8k_judge_normalizes_answer` |
 | φ-merge selects/combines competing branches; pure ⇒ replay-stable; fail-closed (§6, §9) | `test_phi_argmax_selects_top_score`; `test_phi_majority_vote_self_consistency`; `test_phi_merge_replays_identically`; `test_phi_fail_closed_on_empty_candidates`; `test_gsm8k_self_consistency_beats_singlepass` |
+| combined φ-of-SSA arm (refine each line, then merge); paired McNemar analysis (§9) | `test_gsm8k_combined_refines_then_merges`; `test_gsm8k_combined_beats_sc_when_refinement_helps`; `test_mcnemar_paired_and_domination` |
 | SSA write-once | `test_single_assignment_write_once` |
 
 Run `python demo.py` and `python test_invariants.py`; both assert these.
@@ -476,17 +477,25 @@ What changes, and nothing else does:
   validate/repair land on the fail-closed guard (INV-4.2). GOAL/SYNTHESIZER stay mock.
   Run `python demo_ollama.py` (local) or `python eval_cost_routing.py` (cost routing).
 * **Standard-benchmark eval (GSM8K)** — the substrate pointed at grade-school math
-  (`tasks_gsm8k`): SOLVER/CHECKER/ANSWER roles over the same `chat`, run under three
-  configurations — **single-pass** (one shot), **SSA-generational** (a CHECKER drives
-  refinement, each retry a new generation), and **self-consistency** (K sampled solvers
-  merged by a **φ-node** majority-vote — `phi.py`). The harness reports the paper's five
-  numbers — accuracy (does SSA iteration help?), **$ per correct answer** (the cost/quality
-  frontier), mean generations (the SSA metric), wall-clock under concurrency, and replay-
-  equivalence holding live during the eval — the last even under temperature-sampled
-  self-consistency, because every sample is a recorded activity. Correctness is graded by an
-  exact-match **judge** on the gold number; the goal predicate (`AnswerGoal`) only certifies
-  an answer was produced, so the DAG never sees the gold label. Run
-  `python eval_gsm8k.py --data test.jsonl --configs single,ssa,sc`.
+  (`tasks_gsm8k`): SOLVER/CHECKER/ANSWER roles over the same `chat`, run under four
+  configurations that ablate the two construction primitives —
+  **single-pass** (neither), **SSA-generational** (refinement only — a CHECKER drives it, each
+  retry a new generation), **self-consistency** (merge only — K sampled solvers → a **φ-node**
+  majority-vote), and **combined / φ-of-SSA** (both — K lineages each refined then φ-merged),
+  the arm that tests the *compositional* claim. The harness reports the paper's five numbers —
+  accuracy, **$ per correct answer** (the cost/quality frontier), mean generations, wall-clock
+  under concurrency, and replay-equivalence holding live during the eval (even under
+  temperature-sampled self-consistency, because every sample is a recorded activity) — plus a
+  **paired McNemar** analysis over the *shared* task set (the right test when every policy runs
+  the same problems, and the only way to see strict domination or that a small marginal gap is
+  within noise). Correctness is graded by an exact-match **judge** on the gold number; the goal
+  predicate (`AnswerGoal`) only certifies an answer was produced, so the DAG never sees the gold
+  label. Run `python eval_gsm8k.py --data test.jsonl --configs single,ssa,sc,combined --dump p.json`.
+  *Note (a real limitation surfaced by the combined arm):* the substrate builds statically —
+  edges are stamped at node creation under generation monotonicity — so a φ-node cannot grow
+  its fan-in over lineages whose depth a critic decides at runtime. The combined arm therefore
+  uses **fixed-depth** refinement per lineage (pre-unrolled), not the adaptive SSA loop; adaptive
+  dynamic fan-in (a runtime join/barrier) is future work.
 * **φ-nodes (`phi.py`) — merging competing branches.** The SYNTHESIZER aggregates one
   approved branch (arity-1); a φ-node is the arity-N generalization with an explicit selection
   rule — the SSA φ-function made concrete. Competing branches (K solver samples, or two
@@ -523,8 +532,8 @@ What changes, and nothing else does:
 | `executors_ollama.py` | §3.1, §5.2 (native-Ollama `chat` — `format=` structured transport + registry; injectable call, offline-testable) |
 | `executors_openrouter.py` | §4.1, §5.2–5.3, §9 (OpenAI-compatible `chat` — raw-urllib transport + refusal/cost extract + registry; `max_retries=0` by construction; injectable transport) |
 | `phi.py` | §6, §9 (φ-nodes: merge COMPETING branches — argmax-score / majority-vote / union policies; `PhiExecutor` records the selector; pure ⇒ replay-stable, fail-closed) |
-| `tasks_gsm8k.py` | §9 (GSM8K as a DAG task: SOLVER/CHECKER/ANSWER roles + orchestrator over `chat`; single-pass / SSA / self-consistency (φ) registries; JSONL loader + exact-match judge) |
-| `evaluation.py` | §9 (eval harness: policies, run_eval; cost-routing report **and** GSM8K report — accuracy, $/correct, generations, wall-clock, replay) |
+| `tasks_gsm8k.py` | §9 (GSM8K as a DAG task: SOLVER / CHECKER / pure-CRITIC / ANSWER roles + orchestrator over `chat`; single-pass / SSA / self-consistency / **combined (φ-of-SSA)** registries; JSONL loader + exact-match judge) |
+| `evaluation.py` | §9 (eval harness: policies, run_eval; cost-routing report, GSM8K report — accuracy, $/correct, generations, wall-clock, replay — and **paired McNemar** analysis over the shared task set) |
 | `steering.py` | §3.2–3.4 (**pluggable** goal predicate — `GoalPredicate` protocol, `CoverageGoal` / `AnswerGoal`; filter, beam, value) |
 | `governor.py` | §7 (bounds, retry budget) |
 | `scheduler.py` | §2.2, §5.4 (the loop; goal predicate is injectable — the one task-specific seam) |

@@ -23,14 +23,18 @@ AUTHORED sample set (a plumbing smoke test, not a real benchmark number).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 
-from dyndag import gsm8k_registry, gsm8k_report, load_gsm8k, run_eval, sample_tasks
+from dyndag import (gsm8k_registry, gsm8k_report, load_gsm8k, paired_report,
+                    per_problem_rows, run_eval, sample_tasks)
 from dyndag.executors_openrouter import openrouter_chat
 
 OLLAMA_V1 = "http://localhost:11434/v1"
 OPENROUTER_V1 = "https://openrouter.ai/api/v1"
-_KNOWN = ("single", "ssa", "sc")    # sc = self-consistency (K samples, φ majority-vote)
+# sc = self-consistency (K samples, φ majority-vote); combined = φ-of-SSA (K refined lineages).
+_KNOWN = ("single", "ssa", "sc", "combined")
+_SAMPLED = ("sc", "combined")       # arms whose K lineages need temperature diversity
 
 
 def _ollama_up() -> bool:
@@ -62,13 +66,16 @@ def main() -> None:
     ap.add_argument("--data", default=None, help="GSM8K test.jsonl (omit => authored sample set)")
     ap.add_argument("--n", type=int, default=250, help="random subset size (with --seed)")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--configs", default="single,ssa,sc", help="comma list of: single, ssa, sc")
-    ap.add_argument("--k", type=int, default=5, help="self-consistency samples (sc mode)")
+    ap.add_argument("--configs", default="single,ssa,sc,combined",
+                    help="comma list of: single, ssa, sc, combined")
+    ap.add_argument("--k", type=int, default=5, help="samples/lineages for sc and combined")
+    ap.add_argument("--r", type=int, default=1, help="refinement rounds per lineage (combined)")
     ap.add_argument("--sc-temperature", type=float, default=0.8,
-                    help="sampling temperature for sc solvers (diversity)")
+                    help="sampling temperature for sc/combined solvers (diversity)")
     ap.add_argument("--local-model", default="llama3.2")
     ap.add_argument("--cloud-model", default="openai/gpt-4o-mini")
     ap.add_argument("--max-workers", type=int, default=1, help="WIP cap per task (concurrency)")
+    ap.add_argument("--dump", default=None, help="write per-problem results JSON to this path")
     args = ap.parse_args()
 
     configs = [c.strip() for c in args.configs.split(",") if c.strip()]
@@ -88,15 +95,22 @@ def main() -> None:
     source = args.data or "authored-sample"
 
     def _registry_for(c):
-        if c == "sc":                                    # sampled solvers so the K samples differ
-            return gsm8k_registry(make_chat(args.sc_temperature), mode="sc", k=args.k)
-        return gsm8k_registry(make_chat(None), mode=c)   # greedy for single / ssa
+        if c in _SAMPLED:                                 # sampled solvers so the K lineages differ
+            return gsm8k_registry(make_chat(args.sc_temperature), mode=c, k=args.k, r=args.r)
+        return gsm8k_registry(make_chat(None), mode=c)    # greedy for single / ssa
     policies = {c: (lambda c=c: _registry_for(c)) for c in configs}
 
-    print(f"provider={provider}  data={source}  tasks={len(tasks)}  configs={configs}"
-          f"{f'  k={args.k}' if 'sc' in configs else ''}\n")
+    kr = f"  k={args.k} r={args.r}" if any(c in _SAMPLED for c in configs) else ""
+    print(f"provider={provider}  data={source}  tasks={len(tasks)}  configs={configs}{kr}\n")
     results = run_eval(tasks, policies, max_workers=args.max_workers)
     print(gsm8k_report(results))
+    if len(configs) >= 2:
+        print()
+        print(paired_report(results))
+    if args.dump:
+        with open(args.dump, "w", encoding="utf-8") as fh:
+            json.dump(per_problem_rows(results), fh, indent=2)
+        print(f"\nper-problem results -> {args.dump}")
 
 
 if __name__ == "__main__":

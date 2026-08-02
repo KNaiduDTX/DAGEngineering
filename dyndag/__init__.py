@@ -23,9 +23,9 @@ from .views import (render_blackboard, verify_replay, lineage_report,
                     provenance_gaps, cost_report)
 from .evaluation import (EvalTask, TaskResult, DEFAULT_TASKS, run_task, run_eval,
                          cost_routing_report, savings_pct, accuracy, cost_per_correct,
-                         gsm8k_report)
+                         gsm8k_report, mcnemar, paired_report, per_problem_rows)
 from .tasks_gsm8k import (gsm8k_registry, load_gsm8k, sample_tasks, SolverRole,
-                          CheckerRole, AnswerExecutor, GsmOrchestrator)
+                          CheckerRole, CritiqueRole, AnswerExecutor, GsmOrchestrator)
 
 __all__ = [
     "Scheduler", "RunResult", "SQLiteEventStore", "EventStore", "GraphProjection",
@@ -42,7 +42,8 @@ __all__ = [
     "cost_report",
     "EvalTask", "TaskResult", "DEFAULT_TASKS", "run_task", "run_eval",
     "cost_routing_report", "savings_pct", "accuracy", "cost_per_correct", "gsm8k_report",
+    "mcnemar", "paired_report", "per_problem_rows",
     "gsm8k_registry", "load_gsm8k", "sample_tasks", "SolverRole", "CheckerRole",
-    "AnswerExecutor", "GsmOrchestrator",
+    "CritiqueRole", "AnswerExecutor", "GsmOrchestrator",
     "PhiExecutor", "argmax_score", "majority_vote", "union_covered",
 ]
