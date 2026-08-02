@@ -11,11 +11,10 @@ from .nodes import NodeSpec, SubgraphPatch
 from .activities import ActivityRecorder
 from .executors import (Executor, ExecutionResult, Context, ModelRouter,
                         MalformedResultError, TerminalExecutionError, default_registry)
-from .executors_ollama import (OllamaEngineerExecutor, OllamaReviewerExecutor,
-                               RetrievalScoutExecutor, ollama_registry)
-from .executors_openrouter import (OpenRouterEngineerExecutor, OpenRouterReviewerExecutor,
-                                   OpenRouterOrchestratorExecutor, openrouter_registry,
-                                   http_transport)
+from .roles import (EngineerRole, ReviewerRole, OrchestratorRole,
+                    RetrievalScoutExecutor, chat_json_with_repair)
+from .executors_ollama import ollama_chat, ollama_registry
+from .executors_openrouter import openrouter_chat, openrouter_registry, http_transport
 from .steering import CoverageGoal, ConstraintFilter
 from .governor import Budget, CostGovernor
 from .scheduler import Scheduler, RunResult
@@ -27,10 +26,10 @@ from .evaluation import (EvalTask, TaskResult, DEFAULT_TASKS, run_task, run_eval
 __all__ = [
     "Scheduler", "RunResult", "SQLiteEventStore", "EventStore", "GraphProjection",
     "NodeSpec", "SubgraphPatch", "Executor", "ExecutionResult", "Context",
-    "ActivityRecorder", "OllamaEngineerExecutor", "OllamaReviewerExecutor",
-    "RetrievalScoutExecutor", "ollama_registry",
-    "OpenRouterEngineerExecutor", "OpenRouterReviewerExecutor",
-    "OpenRouterOrchestratorExecutor", "openrouter_registry", "http_transport",
+    "ActivityRecorder", "EngineerRole", "ReviewerRole", "OrchestratorRole",
+    "RetrievalScoutExecutor", "chat_json_with_repair",
+    "ollama_chat", "ollama_registry",
+    "openrouter_chat", "openrouter_registry", "http_transport",
     "ModelRouter", "MalformedResultError", "TerminalExecutionError",
     "default_registry", "CoverageGoal", "ConstraintFilter",
     "Budget", "CostGovernor", "NodeType", "NodeState", "Signal", "Tier",

@@ -1,24 +1,22 @@
 """
-executors_openrouter.py — cloud executors over the OpenAI-compatible API (OpenRouter).
+executors_openrouter.py — the OpenAI-compatible backend as a provider-agnostic `chat`.
 
-Provider-AGNOSTIC by construction. A thin raw-stdlib (urllib) transport speaks the
-OpenAI `/chat/completions` wire format, so the same code targets OpenRouter (cloud), a
-local OpenAI-compatible server (Ollama's `/v1`, vLLM, LM Studio), or any OpenAI skin —
-change `base_url` + `model`. No provider SDK is imported, which is the whole point:
+Provider-AGNOSTIC by construction: a raw-stdlib (urllib) transport speaks the OpenAI
+`/chat/completions` wire format, so the same `chat` targets OpenRouter (cloud), a local
+OpenAI-compatible server (Ollama's `/v1`, vLLM, LM Studio), or any skin — change
+`base_url` + `model`. No provider SDK, which is the whole point:
 
-  * **max_retries = 0 by construction** — there is no retry layer beneath the engine's
-    global retry budget, so no nested retry storm (the collision the governor exists to
-    prevent; a provider SDK would need max_retries=0 set explicitly and re-checked on
-    every upgrade — this has nothing to un-set);
+  * **max_retries = 0 by construction** — no retry layer beneath the engine's global
+    retry budget, so no nested retry storm; nothing to un-set or re-check on upgrade;
   * **refusals / content filters / 4xx → TerminalExecutionError** — the node fails
     without spending a retry (retrying a refusal just refuses again);
   * **per-model cost is the provider's own number** — `usage: {include: true}` returns
-    `usage.cost` in dollars, so there is no local pricing table to drift as models and
-    prices change. The scheduler records that dollar figure directly.
+    `usage.cost` in dollars, so there is no local pricing table to drift.
 
-The transport is injectable (`transport=`), so the parse / validate / repair / refusal
-/ cost logic is fully unit-testable offline with a canned completion — no network, no
-key. Nothing in the package imports this at load beyond the (import-safe) re-export.
+The ENGINEER/REVIEWER/ORCHESTRATOR role logic lives once in `roles.py`; this module only
+provides the transport, the extract (refusal + cost), and the `chat` factory + registry.
+The transport is injectable (`transport=`), so the whole path is offline-testable with a
+canned completion — no network, no key.
 """
 
 from __future__ import annotations
@@ -27,16 +25,15 @@ import json
 import os
 from typing import Callable, Optional
 
-from .core import NodeType, Signal
-from .executors import (ExecutionResult, Executor, MalformedResultError,
-                        TerminalExecutionError, default_registry)
-from .nodes import NodeSpec, SubgraphPatch
-from .schemas import DRAFT_SCHEMA, PLAN_SCHEMA, REVIEW_SCHEMA
+from .core import NodeType
+from .executors import TerminalExecutionError, default_registry
+from .roles import (ChatJson, ChatOnce, EngineerRole, OrchestratorRole, ReviewerRole,
+                    chat_json_with_repair)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-# A transport maps (model, messages, response_format) -> an OpenAI-compatible
-# completion dict. The default is the real HTTP call; tests inject a fake.
+# A transport maps (model, messages, response_format) -> an OpenAI-compatible completion
+# dict. The default is the real HTTP call; tests inject a fake.
 Transport = Callable[[str, list, Optional[dict]], dict]
 
 
@@ -102,173 +99,24 @@ def _extract(resp: dict) -> tuple:
     return message.get("content"), usage
 
 
-class _OpenRouterExecutor(Executor):
-    """Base: OpenAI-compatible chat with schema-constrained output, a bounded repair
-    loop, refusal->terminal, and provider cost. Subclasses add role behavior."""
-
-    def __init__(self, model: str = "openai/gpt-4o-mini",
-                 base_url: str = OPENROUTER_BASE_URL, api_key: Optional[str] = None,
-                 repair_attempts: int = 2, transport: Optional[Transport] = None):
-        self.model = model
-        self.repair_attempts = repair_attempts
-        self._transport = transport or http_transport(base_url, api_key)
-
-    def _chat_json(self, messages: list, schema: dict, name: str, required: tuple) -> dict:
-        """Call, validate, repair. Returns {"content": dict, "usage": {...cost}}.
-        MalformedResultError (retryable) if repair exhausts; TerminalExecutionError
-        (no retry) on refusal — the latter is raised out of _extract/transport."""
-        convo = list(messages)
-        fmt = _json_schema_format(name, schema)
-        last_err = ""
-        for _ in range(self.repair_attempts + 1):
-            content, usage = _extract(self._transport(self.model, convo, fmt))
-            try:
-                data = json.loads(content or "")
-                if not isinstance(data, dict) or any(k not in data for k in required):
-                    raise ValueError(f"missing required keys {required}")
-                return {"content": data, "usage": usage}
-            except (json.JSONDecodeError, ValueError, TypeError) as err:
-                last_err = str(err)
-                convo = convo + [
-                    {"role": "assistant", "content": content or ""},
-                    {"role": "user", "content": (
-                        f"That was not valid per the schema ({last_err}). "
-                        f"Return ONLY a JSON object matching the schema.")},
-                ]
-        raise MalformedResultError(
-            f"OpenRouter produced no schema-valid output in {self.repair_attempts + 1} "
-            f"attempts: {last_err}")
+def _openai_call(model: str, transport: Transport) -> ChatOnce:
+    """A single structured call over an OpenAI-compatible transport (with refusal + cost)."""
+    def call_once(messages, schema, name):
+        return _extract(transport(model, messages, _json_schema_format(name, schema)))
+    return call_once
 
 
-class OpenRouterEngineerExecutor(_OpenRouterExecutor):
-    """Generation/refinement over the OpenAI-compatible API. Content is real; `quality`
-    stays deterministic so the mock-critic path converges (a real REVIEWER scores)."""
+def openrouter_chat(model: str = "openai/gpt-4o-mini", base_url: str = OPENROUTER_BASE_URL,
+                    api_key: Optional[str] = None, repair_attempts: int = 2,
+                    transport: Optional[Transport] = None) -> ChatJson:
+    """A provider-agnostic `chat` over the OpenAI-compatible API (OpenRouter default).
+    Pass `transport=` a fake to unit-test the repair loop + roles offline, or point
+    `base_url` at any OpenAI-compatible endpoint (e.g. Ollama's /v1)."""
+    call_once = _openai_call(model, transport or http_transport(base_url, api_key))
 
-    def run(self, inputs, params, ctx) -> ExecutionResult:
-        revision = params.get("revision", 0)
-        subtopics = list(params["subtopics"])
-        topic = params["topic"]
-        material = [v for v in inputs.values() if isinstance(v, dict)]
-        messages = [
-            {"role": "system", "content": ("You are a technical writer. Using the source "
-                                           "material, write one section per required subtopic. "
-                                           "Respond with JSON only.")},
-            {"role": "user", "content": json.dumps({
-                "topic": topic, "required_subtopics": subtopics, "source_material": material,
-                "critique_to_address": params.get("critique")})},
-        ]
-        recorded = ctx.record(f"draft_rev{revision}",
-                              lambda: self._chat_json(messages, DRAFT_SCHEMA, "draft",
-                                                      ("covered", "sections")))
-        data, usage = recorded["content"], recorded.get("usage")
-        quality = round(0.60 + 0.30 * min(revision, 1), 3)
-        return ExecutionResult(output={
-            "kind": "draft", "topic": topic, "revision": revision, "covered": subtopics,
-            "quality": quality, "note": "revised per critique" if revision else "initial pass",
-            "supersedes": None,
-            "sections": {s.get("subtopic", ""): s.get("text", "")
-                         for s in data.get("sections", []) if isinstance(s, dict)},
-        }, signal=Signal.CONTINUE, score=quality, usage=usage)
-
-
-class OpenRouterReviewerExecutor(_OpenRouterExecutor):
-    """The critic over the OpenAI-compatible API: scores the draft's content and steers
-    (reject -> refinement stratum / approve -> synthesizer), like the mock but real."""
-
-    def run(self, inputs, params, ctx) -> ExecutionResult:
-        target = params["target_score"]
-        subtopics = list(params["subtopics"])
-        draft = next(v for v in inputs.values() if isinstance(v, dict) and v.get("kind") == "draft")
-        draft_id = next(k for k, v in inputs.items() if v is draft)
-        messages = [
-            {"role": "system", "content": ("You are a strict technical reviewer. Score the brief "
-                                           "0.0-1.0 on coverage and accuracy of the required "
-                                           "subtopics, and give a one-line critique. JSON only.")},
-            {"role": "user", "content": json.dumps({
-                "required_subtopics": subtopics, "target_score": target,
-                "brief_sections": draft.get("sections", {})})},
-        ]
-        recorded = ctx.record(f"review_{draft_id}",
-                              lambda: self._chat_json(messages, REVIEW_SCHEMA, "review",
-                                                      ("score", "critique")))
-        data, usage = recorded["content"], recorded.get("usage")
-        score = max(0.0, min(1.0, float(data["score"])))
-        critique = str(data.get("critique", ""))
-        if target - score > 1e-9:
-            refined = NodeSpec(key="engineer", node_type=NodeType.ENGINEER,
-                               input_keys=(draft_id, ctx.self_id),
-                               params={"topic": draft["topic"], "subtopics": subtopics,
-                                       "revision": draft["revision"] + 1, "critique": critique})
-            re_review = NodeSpec(key="reviewer", node_type=NodeType.REVIEWER, input_keys=("engineer",),
-                                 params={"target_score": target, "subtopics": subtopics})
-            return ExecutionResult(
-                output={"verdict": "reject", "score": round(score, 3), "critique": critique},
-                signal=Signal.NEEDS_REFINEMENT, score=score, usage=usage,
-                patch=SubgraphPatch(added_nodes=[refined, re_review]))
-        synth = NodeSpec(key="synthesizer", node_type=NodeType.SYNTHESIZER,
-                         input_keys=(draft_id, ctx.self_id),
-                         params={"subtopics": subtopics, "target_score": target})
-        return ExecutionResult(output={"verdict": "approve", "score": round(score, 3)},
-                               signal=Signal.DONE, score=score, usage=usage,
-                               patch=SubgraphPatch(added_nodes=[synth]))
-
-
-class OpenRouterOrchestratorExecutor(_OpenRouterExecutor):
-    """The expander, for real — and the answer to the recursive-patch problem. Rather
-    than have the model emit a `SubgraphPatch` (recursive, unvalidatable, rejected by
-    structured-output backends), the model emits a FLAT plan (which scouts to run, a
-    brief for the engineer, a review rubric) and this executor assembles the
-    scouts -> engineer -> reviewer subgraph deterministically. The model chooses content
-    within a fixed template; the code builds the DAG — safe by construction.
-
-    Coverage is guaranteed: every required subtopic gets a scout even if the model
-    omits it (post-fill), so the goal predicate stays reachable no matter what the
-    model plans."""
-
-    def run(self, inputs, params, ctx) -> ExecutionResult:
-        goal = ctx.goal if isinstance(ctx.goal, dict) else {}
-        required = list(goal.get("subtopics", []))
-        topic = goal.get("topic", "")
-        target = goal.get("target_score", 0.8)
-        messages = [
-            {"role": "system", "content": (
-                "You are a research orchestrator. Plan how to produce a vetted brief: choose "
-                "the scouts (one per subtopic to investigate, each with a focus), a brief for "
-                "the engineer, and a review rubric. You MUST include every required subtopic "
-                "among the scouts. Respond with JSON only.")},
-            {"role": "user", "content": json.dumps({
-                "topic": topic, "required_subtopics": required, "target_score": target})},
-        ]
-        recorded = ctx.record("plan",
-                              lambda: self._chat_json(messages, PLAN_SCHEMA, "plan",
-                                                      ("scouts", "engineer_brief", "review_rubric")))
-        data, usage = recorded["content"], recorded.get("usage")
-
-        # Deterministic assembly. Model picks scout subtopics/focus; we GUARANTEE the
-        # required subtopics are covered (post-fill any the model omitted).
-        planned: dict = {}
-        for s in data.get("scouts", []):
-            if isinstance(s, dict) and s.get("subtopic"):
-                planned[str(s["subtopic"])] = str(s.get("focus", ""))
-        for st in required:
-            planned.setdefault(st, "")
-        subtopics = list(planned.keys())
-
-        scouts = [NodeSpec(key=f"scout_{st}", node_type=NodeType.SCOUT,
-                           input_keys=(ctx.self_id,),
-                           params={"subtopic": st, "topic": topic, "focus": focus})
-                  for st, focus in planned.items()]
-        engineer = NodeSpec(key="engineer", node_type=NodeType.ENGINEER,
-                            input_keys=tuple(s.key for s in scouts),
-                            params={"topic": topic, "subtopics": subtopics, "revision": 0,
-                                    "brief": data.get("engineer_brief", "")})
-        reviewer = NodeSpec(key="reviewer", node_type=NodeType.REVIEWER, input_keys=("engineer",),
-                            params={"target_score": target, "subtopics": subtopics,
-                                    "rubric": data.get("review_rubric", "")})
-        patch = SubgraphPatch(added_nodes=[*scouts, engineer, reviewer])
-        return ExecutionResult(
-            output={"plan": subtopics, "engineer_brief": data.get("engineer_brief", "")},
-            signal=Signal.CONTINUE, patch=patch, usage=usage)
+    def chat(messages, schema, name, required):
+        return chat_json_with_repair(call_once, messages, schema, name, required, repair_attempts)
+    return chat
 
 
 def openrouter_registry(model: str = "openai/gpt-4o-mini", base_url: str = OPENROUTER_BASE_URL,
@@ -276,11 +124,11 @@ def openrouter_registry(model: str = "openai/gpt-4o-mini", base_url: str = OPENR
                         **kwargs) -> dict:
     """`default_registry()` with a real ORCHESTRATOR, ENGINEER, and REVIEWER over the
     OpenAI-compatible API (OpenRouter default). GOAL/SCOUT/SYNTHESIZER stay mock (the
-    eval composes a real retrieval SCOUT where wanted). Pass `transport=` to target a
-    fake (tests) or any other OpenAI-compatible endpoint (e.g. Ollama's /v1)."""
-    common = dict(model=model, base_url=base_url, api_key=api_key, transport=transport, **kwargs)
+    eval composes a real retrieval SCOUT where wanted)."""
+    chat = openrouter_chat(model=model, base_url=base_url, api_key=api_key,
+                           transport=transport, **kwargs)
     registry = default_registry()
-    registry[NodeType.ORCHESTRATOR] = OpenRouterOrchestratorExecutor(**common)
-    registry[NodeType.ENGINEER] = OpenRouterEngineerExecutor(**common)
-    registry[NodeType.REVIEWER] = OpenRouterReviewerExecutor(**common)
+    registry[NodeType.ORCHESTRATOR] = OrchestratorRole(chat)
+    registry[NodeType.ENGINEER] = EngineerRole(chat)
+    registry[NodeType.REVIEWER] = ReviewerRole(chat)
     return registry

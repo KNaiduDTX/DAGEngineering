@@ -28,33 +28,35 @@ import sys
 
 from dyndag import (DEFAULT_TASKS, NodeType, RetrievalScoutExecutor, cost_routing_report,
                     default_registry, run_eval)
-from dyndag.executors_openrouter import (OpenRouterEngineerExecutor,
-                                         OpenRouterOrchestratorExecutor,
-                                         OpenRouterReviewerExecutor)
+from dyndag.roles import EngineerRole, OrchestratorRole, ReviewerRole
+from dyndag.executors_openrouter import openrouter_chat
 
 OLLAMA_V1 = "http://localhost:11434/v1"
 OPENROUTER_V1 = "https://openrouter.ai/api/v1"
 
 
 def _chat_fleet(base_url, model, api_key):
-    """A registry: real retrieval SCOUT + OpenAI-compatible ORCHESTRATOR/ENGINEER/REVIEWER
-    against one endpoint. GOAL/SYNTHESIZER stay mock."""
-    common = dict(model=model, base_url=base_url, api_key=api_key)
+    """A registry: real retrieval SCOUT + ORCHESTRATOR/ENGINEER/REVIEWER over one
+    OpenAI-compatible `chat` (one endpoint). GOAL/SYNTHESIZER stay mock."""
+    chat = openrouter_chat(model=model, base_url=base_url, api_key=api_key)
     reg = default_registry()
     reg[NodeType.SCOUT] = RetrievalScoutExecutor()
-    reg[NodeType.ORCHESTRATOR] = OpenRouterOrchestratorExecutor(**common)
-    reg[NodeType.ENGINEER] = OpenRouterEngineerExecutor(**common)
-    reg[NodeType.REVIEWER] = OpenRouterReviewerExecutor(**common)
+    reg[NodeType.ORCHESTRATOR] = OrchestratorRole(chat)
+    reg[NodeType.ENGINEER] = EngineerRole(chat)
+    reg[NodeType.REVIEWER] = ReviewerRole(chat)
     return reg
 
 
 def _type_aware(local_model, cloud_model, cloud_key):
-    """Cheap roles local, outcome-gating roles cloud."""
+    """Cheap/high-fan-out roles local, outcome-gating roles cloud — the same roles, wired
+    to different `chat` backends by base_url."""
+    local = openrouter_chat(model=local_model, base_url=OLLAMA_V1, api_key="ollama")
+    cloud = openrouter_chat(model=cloud_model, base_url=OPENROUTER_V1, api_key=cloud_key)
     reg = default_registry()
-    reg[NodeType.SCOUT] = RetrievalScoutExecutor()                                   # local (no chat)
-    reg[NodeType.ENGINEER] = OpenRouterEngineerExecutor(model=local_model, base_url=OLLAMA_V1, api_key="ollama")
-    reg[NodeType.ORCHESTRATOR] = OpenRouterOrchestratorExecutor(model=cloud_model, base_url=OPENROUTER_V1, api_key=cloud_key)
-    reg[NodeType.REVIEWER] = OpenRouterReviewerExecutor(model=cloud_model, base_url=OPENROUTER_V1, api_key=cloud_key)
+    reg[NodeType.SCOUT] = RetrievalScoutExecutor()          # local retrieval (no chat)
+    reg[NodeType.ENGINEER] = EngineerRole(local)
+    reg[NodeType.ORCHESTRATOR] = OrchestratorRole(cloud)
+    reg[NodeType.REVIEWER] = ReviewerRole(cloud)
     return reg
 
 

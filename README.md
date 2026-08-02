@@ -63,8 +63,10 @@ activities.py           recorded activities — exactly-once model calls/replay 
 schemas.py              shared structured-output contracts (DRAFT/REVIEW/PLAN) L2
 executors.py            mock role executors, typed signals, ModelRouter,       L3 L4 L5
                         retryable/terminal error taxonomy
-executors_ollama.py     real local fleet: retrieval SCOUT + Ollama ENG/REVIEW  L3 L4
-executors_openrouter.py real cloud fleet: OpenAI-compatible ORCH/ENG/REVIEW    L4 L5
+roles.py                model-backed ENGINEER/REVIEWER/ORCHESTRATOR over an     L3 L4
+                        abstract chat (one copy) + prompts + retrieval SCOUT
+executors_ollama.py     native-Ollama chat: format= transport + registry       L5
+executors_openrouter.py OpenAI-compatible chat: urllib transport, refusal+cost L4 L5
 steering.py             goal predicate, constraint filter, beam, value fn      L3
 governor.py             caps + GLOBAL retry budget                             L7
 scheduler.py            the loop: admit→execute→commit; batch / async /        L5
@@ -75,13 +77,15 @@ evaluation.py           cost-routing eval harness (policies, run_eval, report) L
 
 ## Plugging in real models
 
-Replace the body of any `Executor.run` in `executors.py` with a model call. The
-scheduler, provenance, steering, durability, and governance layers are unchanged.
-Wrap each model/tool/IO call as a *recorded activity* (`ctx.record(key, fn)`, stored
-as an `ACTIVITY_RECORDED` event) so replay/retry never re-runs it — see `SPEC.md`
-§5.2 and §9.
+The model-backed roles live **once** in `roles.py` (ENGINEER / REVIEWER / ORCHESTRATOR
++ their prompts + the shared validate→repair loop), written against an abstract `chat`
+capability. Each provider module supplies only a thin `chat` transport, so adding a
+backend is a transport — not another copy of the roles. (The mock roles in
+`executors.py` stay the reference bodies you'd start from.) Every model/tool/IO call is
+wrapped as a *recorded activity* (`ctx.record(key, fn)`, stored as an `ACTIVITY_RECORDED`
+event) so replay/retry never re-runs it — see `SPEC.md` §5.2 and §9.
 
-Real executors ship for both tiers:
+Real executors ship for both tiers (thin transports over the shared roles):
 
 * **Local** (`executors_ollama.py`): a retrieval **SCOUT** (ranks a corpus per subtopic
   — offline lexical default, embeddings-ready) + Ollama **ENGINEER** and **REVIEWER**.
