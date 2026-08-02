@@ -129,8 +129,3 @@ only parallelizable phase; admit and commit stay serial and single-writer (the s
 See `SPEC.md` for the full contracts, schemas, invariants, and the PoC→prod delta.
 
 
-IP and licensing:
-
-IP Ownership rights are retained by Karthik Naidu and Associated Researchers listed as contributors in the Design paper as well as evaluatory paper to be published
-
-Plutus CCE is granted a non-transferable license with further provisions based on tentative discussions and considerations exchanged
