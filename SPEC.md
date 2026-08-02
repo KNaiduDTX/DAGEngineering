@@ -448,7 +448,10 @@ What changes, and nothing else does:
   guards (they sit at the store boundary).
 * **Deterministic executors → real models** at the single `Executor.run` seam.
   Wrap each model/tool/IO call as a recorded Activity so INV-5.1 still holds.
-  *Done for the local fleet, cloud fleet, and the planner:*
+  *Done for the local fleet, cloud fleet, and the planner — the role logic
+  (ENGINEER/REVIEWER/ORCHESTRATOR) and prompts live once in `roles.py` over an abstract
+  `chat`; each provider module supplies only a thin transport, so a new backend is a
+  transport, not another copy of the roles:*
   - **Local** (`executors_ollama`): retrieval SCOUT (corpus ranking; offline lexical
     default, embeddings-ready) + Ollama ENGINEER + REVIEWER.
   - **Cloud** (`executors_openrouter`): OpenAI-compatible ORCHESTRATOR + ENGINEER +
@@ -486,9 +489,10 @@ What changes, and nothing else does:
 | `nodes.py` | §2.1, §2.3 (patch, placeholders) |
 | `activities.py` | §5.2 (recorded activities — replay/idempotency at the executor seam) |
 | `schemas.py` | §2.1, §9 (shared structured-output contracts: DRAFT/REVIEW/PLAN — flat, non-recursive) |
-| `executors.py` | §3.1, §4.1–4.2, §5.3, §9 (roles, critic loop, routing, retryable/terminal taxonomy) |
-| `executors_ollama.py` | §3.1, §4.1, §5.2–5.3 (real retrieval SCOUT + Ollama ENGINEER/REVIEWER) |
-| `executors_openrouter.py` | §4.1, §5.2–5.3, §9 (cloud OpenAI-compatible ORCHESTRATOR/ENGINEER/REVIEWER; refusal→terminal; per-model cost) |
+| `executors.py` | §3.1, §4.1–4.2, §5.3, §9 (mock roles, critic loop, routing, retryable/terminal taxonomy) |
+| `roles.py` | §3.1, §4.1, §5.2–5.3, §9 (**single source** of the model-backed ENGINEER/REVIEWER/ORCHESTRATOR logic + prompts + the shared validate→repair loop, over an abstract `chat`; real retrieval SCOUT) |
+| `executors_ollama.py` | §3.1, §5.2 (native-Ollama `chat` — `format=` structured transport + registry; injectable call, offline-testable) |
+| `executors_openrouter.py` | §4.1, §5.2–5.3, §9 (OpenAI-compatible `chat` — raw-urllib transport + refusal/cost extract + registry; `max_retries=0` by construction; injectable transport) |
 | `evaluation.py` | §9 (cost-routing eval harness: policies, run_eval, cost_routing_report) |
 | `steering.py` | §3.2–3.4 (predicate, filter, beam, value) |
 | `governor.py` | §7 (bounds, retry budget) |

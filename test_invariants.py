@@ -464,9 +464,8 @@ def test_openrouter_refusal_is_terminal():
 
 def test_openrouter_repair_loop_and_cost_extraction():
     """The validate->repair loop re-prompts on invalid JSON then succeeds, and provider
-    cost is extracted — exercised directly on the reviewer's structured-chat helper."""
-    from dyndag import RetrievalScoutExecutor  # noqa: F401 (ensure package import path)
-    from dyndag.executors_openrouter import OpenRouterReviewerExecutor
+    cost is extracted — exercised directly on the OpenAI-compatible `chat`."""
+    from dyndag.executors_openrouter import openrouter_chat
     from dyndag.schemas import REVIEW_SCHEMA
 
     calls = {"n": 0}
@@ -476,12 +475,36 @@ def test_openrouter_repair_loop_and_cost_extraction():
         content = "not json at all" if calls["n"] == 1 else json.dumps({"score": 0.9, "critique": "ok"})
         return _or_completion(content, cost=0.0005)
 
-    ex = OpenRouterReviewerExecutor(transport=transport, repair_attempts=2)
-    out = ex._chat_json([{"role": "user", "content": "x"}], REVIEW_SCHEMA, "review",
-                        ("score", "critique"))
+    chat = openrouter_chat(transport=transport, repair_attempts=2)
+    out = chat([{"role": "user", "content": "x"}], REVIEW_SCHEMA, "review", ("score", "critique"))
     assert calls["n"] == 2, f"expected one repair, got {calls['n']} calls"
     assert out["content"]["score"] == 0.9
     assert out["usage"]["cost"] == 0.0005
+
+
+def test_ollama_chat_path_offline():
+    """The refactor makes the native-Ollama backend offline-testable too: an injected
+    single-call primitive drives the shared repair loop + the shared EngineerRole (no
+    `ollama` package, no server). Proves the two providers share one role/repair path."""
+    from dyndag import EngineerRole, ollama_chat
+
+    calls = {"n": 0}
+
+    def fake_call(messages, schema, name):
+        calls["n"] += 1
+        content = "garbage" if calls["n"] == 1 else json.dumps(
+            {"covered": ["a"], "sections": [{"subtopic": "a", "text": "t"}]})
+        return content, {"input_tokens": 10, "output_tokens": 5}
+
+    chat = ollama_chat(call=fake_call, repair_attempts=2)
+    reg = default_registry()
+    reg[NodeType.ENGINEER] = EngineerRole(chat)     # mock REVIEWER converges the loop
+    store = SQLiteEventStore(":memory:")
+    r = Scheduler(store, reg, budget=Budget()).run(dict(ONE))
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    assert calls["n"] >= 2, f"repair loop not exercised (calls={calls['n']})"
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
 
 
 def test_openrouter_orchestrator_plans_and_guarantees_coverage():
