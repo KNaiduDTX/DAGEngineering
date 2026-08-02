@@ -1,0 +1,15 @@
+# GSM8K dataset — user-downloaded (MIT-licensed), never committed
+test.jsonl
+train.jsonl
+gsm8k*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local scratch / event stores
+*.sqlite
+*.db

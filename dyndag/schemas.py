@@ -54,3 +54,28 @@ PLAN_SCHEMA = {
     },
     "required": ["scouts", "engineer_brief", "review_rubric"],
 }
+
+# SOLVER output (question-answering, e.g. GSM8K): step-by-step reasoning + the final answer.
+# `final_answer` is a STRING so "18", "18.0", "$18" all validate; the eval judge normalizes
+# before the exact-match comparison — the model is never asked to guess a numeric type.
+SOLUTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "reasoning": {"type": "string"},
+        "final_answer": {"type": "string"},
+    },
+    "required": ["reasoning", "final_answer"],
+}
+
+# CHECKER output: did the reasoning check out, how confident (0.0-1.0), and a one-line
+# critique to feed the next SSA revision. The checker never sees the gold answer — it judges
+# self-consistency of the reasoning, and `confidence` drives the approve/refine gate.
+VERIFY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verified": {"type": "boolean"},
+        "confidence": {"type": "number"},
+        "critique": {"type": "string"},
+    },
+    "required": ["verified", "confidence", "critique"],
+}

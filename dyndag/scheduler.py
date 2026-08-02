@@ -36,7 +36,7 @@ from .executors import (Context, ExecutionResult, Executor, MalformedResultError
 from .governor import Budget, CostGovernor
 from .graph import GraphProjection
 from .nodes import NodeSpec, SubgraphPatch, resolve_placeholders
-from .steering import ConstraintFilter, CoverageGoal
+from .steering import ConstraintFilter, CoverageGoal, GoalPredicate
 from .store import EventStore
 
 
@@ -72,6 +72,7 @@ class Scheduler:
         constraint_filter: Optional[ConstraintFilter] = None,
         beam_width: int = 0,                      # 0 => no beam pruning
         max_workers: int = 1,                     # 1 => serial execute; >1 => real WIP cap
+        goal_predicate: Optional[GoalPredicate] = None,  # None => CoverageGoal from the goal dict
     ):
         self.store = store
         self.registry = registry
@@ -79,6 +80,7 @@ class Scheduler:
         self.governor = CostGovernor(budget or Budget())
         self.filter = constraint_filter or ConstraintFilter()
         self.beam_width = beam_width
+        self.goal_predicate = goal_predicate
         self.max_workers = max(1, int(max_workers))
         self.graph = GraphProjection()
 
@@ -373,6 +375,14 @@ class Scheduler:
         self._emit(Event(run_id=run_id, type=EventType.NODE_REOPENED, node_id=node_id,
                          payload={"attempt": self.graph.nodes[node_id].attempts}))
 
+    def _predicate_for(self, goal: dict) -> GoalPredicate:
+        """The terminal test for this run: an injected predicate if given, else the default
+        CoverageGoal built from the goal dict (the brief task's contract). Injecting one is
+        how a different task (e.g. GSM8K's AnswerGoal) reaches GOAL_SATISFIED without any
+        change to the loop — the only task-specific coupling in the scheduler lives here."""
+        return self.goal_predicate or CoverageGoal(
+            subtopics=goal["subtopics"], target_score=goal["target_score"])
+
     # --------------------------------------------------------------------- #
     # the run                                                                 #
     # --------------------------------------------------------------------- #
@@ -381,8 +391,7 @@ class Scheduler:
         self._emit(Event(run_id=run_id, type=EventType.RUN_STARTED,
                          payload={"goal": goal}))
 
-        predicate = CoverageGoal(subtopics=goal["subtopics"],
-                                 target_score=goal["target_score"])
+        predicate = self._predicate_for(goal)
 
         # Seed: a GOAL source node (gen 0) and the root ORCHESTRATOR (gen 1).
         goal_id = self._create_node(run_id, "goal", NodeType.GOAL, 0, (),
@@ -474,7 +483,7 @@ class Scheduler:
     async def _run_workers(self, goal: dict, n_workers: int, max_inflight: int) -> RunResult:
         run_id = new_run_id()
         self._emit(Event(run_id=run_id, type=EventType.RUN_STARTED, payload={"goal": goal}))
-        predicate = CoverageGoal(subtopics=goal["subtopics"], target_score=goal["target_score"])
+        predicate = self._predicate_for(goal)
         goal_id = self._create_node(run_id, "goal", NodeType.GOAL, 0, (),
                                     {"goal": goal}, expander_id=None)
         self._create_node(run_id, "orchestrator", NodeType.ORCHESTRATOR, 1,
