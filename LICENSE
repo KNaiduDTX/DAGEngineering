@@ -1,0 +1,351 @@
+# PLUTUS CCE — PROPRIETARY SOFTWARE LICENSE AGREEMENT
+
+**Version:** 1.0
+**Effective Date:** June 26, 2025
+
+---
+
+## 1. PARTIES
+
+**Licensor:** Karthik Naidu and Associated Researchers (collectively, the
+"Licensor"), being the individuals listed as contributors in the repository
+commit history and/or designated as contributors in the Design Paper and
+Evaluatory Paper referenced in the project documentation.
+
+**Licensee:** Plutus CCE LLC, 14733 Holly Tree Lane, Frisco, TX 75035
+(the "Licensee").
+
+---
+
+## 2. DEFINITIONS
+
+**"Software"** means all source code, object code, binaries, scripts,
+configuration files, documentation, data files, and associated materials
+contained in this repository or otherwise provided by Licensor to Licensee
+under this Agreement, including any updates, patches, or modifications
+provided by Licensor.
+
+**"Documentation"** means any user manuals, technical specifications, design
+documents, API descriptions, or other written materials accompanying or
+referencing the Software.
+
+**"Derivative Work"** means any modification, adaptation, translation, or
+enhancement of the Software, or any work derived from or based upon the
+Software, in whole or in part.
+
+**"Confidential Information"** means the Software, source code, Documentation,
+pricing terms, technical data, algorithms, trade secrets, and any other
+non-public information disclosed by Licensor to Licensee.
+
+**"Associated Researchers"** means the individuals identified as contributors
+to the Software, as listed in the repository commit history and/or formally
+designated in the Design Paper and Evaluatory Paper referenced in the project
+documentation.
+
+**"Effective Date"** means the date specified above or, if none is specified,
+the date on which Licensee first accesses, clones, downloads, or uses the
+Software.
+
+---
+
+## 3. GRANT OF LICENSE
+
+Subject to Licensee's compliance with all terms and conditions of this
+Agreement, Licensor hereby grants to Licensee a **non-exclusive,
+non-transferable, non-sublicensable, revocable, limited license** to:
+
+  (a) **Use** the Software solely for Licensee's internal business operations
+      and internal research purposes;
+
+  (b) **Reproduce** the Software solely to the extent necessary for the
+      permitted use described above;
+
+  (c) **Modify** the Software solely for Licensee's internal use, provided
+      that all modifications remain subject to the terms of this Agreement
+      and that Licensor retains all rights in such modifications as
+      Derivative Works (see Section 5).
+
+This license does **not** grant Licensee any right to:
+
+  (d) Distribute, sell, rent, lease, lend, or otherwise make the Software
+      available to any third party;
+  (e) Sublicense, assign, or transfer this license or any rights granted
+      hereunder to any third party;
+  (f) Use the Software for any commercial product or service offered to third
+      parties, except as expressly permitted in a separate written agreement
+      with Licensor;
+  (g) Use the Software in any manner not expressly authorized by this
+      Agreement.
+
+---
+
+## 4. RESTRICTIONS AND PROHIBITED USES
+
+Licensee shall **not**, and shall not permit any third party to:
+
+  (a) Reverse engineer, decompile, disassemble, or otherwise attempt to
+      derive the source code of the Software, except to the extent that
+      such restriction is expressly prohibited by applicable law;
+
+  (b) Remove, alter, or obscure any copyright notices, proprietary legends,
+      trademark attributions, or license terms contained in or on the
+      Software;
+
+  (c) Use the Software, its outputs, or its Documentation to train, benchmark,
+      or develop any machine-learning model, artificial intelligence system,
+      or any product that competes with the Software;
+
+  (d) Use the Software in any high-risk or safety-critical application,
+      including but not limited to medical devices, aviation systems,
+      nuclear facilities, autonomous vehicles, or any application where
+      failure of the Software could reasonably be expected to result in
+      serious injury or death, without prior written consent from Licensor;
+
+  (e) Use the Software for any unlawful purpose or in violation of any
+      applicable law or regulation;
+
+  (f) Copy or reproduce the Software beyond what is necessary for the
+      permitted internal use and customary backup/archival purposes;
+
+  (g) Publish, disclose, or otherwise make public any benchmarking or
+      performance testing results of the Software without prior written
+      consent from Licensor;
+
+  (h) Circumvent or attempt to circumvent any technological protection
+      measures or access controls implemented in the Software.
+
+---
+
+## 5. INTELLECTUAL PROPERTY OWNERSHIP
+
+  (a) **Ownership Retained.** All right, title, and interest in and to the
+      Software, including all copyrights, patents, trade secrets, trademarks,
+      and other intellectual property rights, are and shall remain the
+      exclusive property of Karthik Naidu and the Associated Researchers.
+      This Agreement does not convey any ownership rights in the Software
+      to Licensee.
+
+  (b) **Reservation of Rights.** All rights not expressly granted to
+      Licensee in this Agreement are reserved by Licensor. No rights are
+      granted by implication, estoppel, or otherwise.
+
+  (c) **Derivative Works.** Licensee acknowledges that any Derivative Works
+      created by Licensee are based upon and derived from the Software,
+      which remains the exclusive property of Licensor. Licensee shall
+      have no ownership interest in Derivative Works beyond the limited
+      internal-use license granted in Section 3. Licensor shall own all
+      right, title, and interest in and to any Derivative Works, subject
+      to Licensee's limited internal-use rights under this Agreement.
+      Licensee shall provide Licensor with a copy of any Derivative Works
+      upon request.
+
+  (d) **Feedback.** If Licensee provides Licensor with any feedback,
+      suggestions, improvements, or ideas regarding the Software
+      ("Feedback"), Licensor may freely use, modify, and incorporate such
+      Feedback into the Software or other projects without any obligation
+      or compensation to Licensee.
+
+  (e) **Associated Researchers.** The Associated Researchers shall be
+      identified as contributors to the Software. The Design Paper and
+      Evaluatory Paper (to be published) shall formally list the
+      Associated Researchers, and such listing shall serve as a record of
+      their contribution. Any use of the Software shall acknowledge the
+      Licensor and Associated Researchers as the creators and owners of
+      the Software.
+
+---
+
+## 6. FEES AND PAYMENT
+
+  (a) Unless otherwise agreed in a separate written agreement, no license
+      fee is charged for the internal-use license granted under this
+      Agreement.
+
+  (b) Any commercial use, distribution, or sublicensing of the Software
+      requires a separate written agreement and may be subject to
+      additional fees, royalties, or other consideration as determined by
+      Licensor.
+
+  (c) Licensee is responsible for any taxes, duties, or similar charges
+      arising from its use of the Software, excluding taxes based on
+      Licensor's net income.
+
+---
+
+## 7. CONFIDENTIALITY
+
+  (a) Licensee shall hold all Confidential Information of Licensor in strict
+      confidence and shall not disclose it to any third party without
+      Licensor's prior written consent.
+
+  (b) Licensee shall protect Confidential Information using at least the same
+      degree of care it uses to protect its own confidential information of
+      similar importance, but no less than reasonable care.
+
+  (c) The obligations in this Section shall survive termination of this
+      Agreement for a period of five (5) years.
+
+  (d) Confidential Information does not include information that:
+      (i) is or becomes publicly available without breach of this Agreement;
+      (ii) was known to Licensee without restriction prior to disclosure;
+      (iii) is independently developed without use of or reference to
+      Confidential Information; or
+      (iv) is required to be disclosed by law or court order, provided
+      that Licensee gives Licensor reasonable prior notice to seek a
+      protective order.
+
+---
+
+## 8. WARRANTY DISCLAIMER
+
+THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE," WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE IMPLIED
+WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE,
+NON-INFRINGEMENT, OR THAT THE SOFTWARE WILL BE ERROR-FREE, UNINTERRUPTED,
+OR FREE OF HARMFUL COMPONENTS. LICENSOR DOES NOT WARRANT THAT THE SOFTWARE
+WILL MEET LICENSEE'S REQUIREMENTS OR THAT THE OPERATION OF THE SOFTWARE
+WILL BE UNINTERRUPTED OR ERROR-FREE. LICENSEE ASSUMES ALL RISK ARISING FROM
+ITS USE OF THE SOFTWARE. NO ORAL OR WRITTEN ADVICE GIVEN BY LICENSOR OR ITS
+ASSOCIATED RESEARCHERS SHALL CREATE A WARRANTY.
+
+---
+
+## 9. LIMITATION OF LIABILITY
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL
+LICENSOR OR ANY ASSOCIATED RESEARCHER BE LIABLE FOR ANY INDIRECT,
+INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES,
+INCLUDING BUT NOT LIMITED TO LOSS OF PROFITS, LOSS OF DATA, LOSS OF
+BUSINESS, LOSS OF GOODWILL, OR COST OF SUBSTITUTE GOODS OR SERVICES,
+ARISING OUT OF OR RELATING TO THIS AGREEMENT OR THE USE OF OR INABILITY
+TO USE THE SOFTWARE, EVEN IF LICENSOR HAS BEEN ADVISED OF THE POSSIBILITY
+OF SUCH DAMAGES.
+
+IN NO EVENT SHALL LICENSOR'S AGGREGATE LIABILITY UNDER THIS AGREEMENT
+EXCEED THE TOTAL AMOUNT OF FEES PAID BY LICENSEE TO LICENSOR IN THE TWELVE
+(12) MONTHS PRECEDING THE CLAIM, OR, IF NO FEES HAVE BEEN PAID, ZERO
+DOLLARS ($0.00).
+
+THE LIMITATIONS AND EXCLUSIONS IN THIS SECTION SHALL APPLY EVEN IF ANY
+LIMITED REMEDY FAILS OF ITS ESSENTIAL PURPOSE.
+
+---
+
+## 10. TERM AND TERMINATION
+
+  (a) **Term.** This Agreement commences on the Effective Date and
+      continues until terminated in accordance with its terms.
+
+  (b) **Termination by Licensor.** Licensor may terminate this Agreement
+      immediately upon written notice if Licensee:
+      (i) breaches any material term of this Agreement and fails to cure
+      such breach within thirty (30) days of written notice;
+      (ii) engages in any unauthorized use, distribution, or
+      reverse-engineering of the Software; or
+      (iii) becomes insolvent, files for bankruptcy, or ceases operations.
+
+  (c) **Termination by Licensee.** Licensee may terminate this Agreement
+      at any time by ceasing all use of the Software and destroying all
+      copies as provided in Section 10(d).
+
+  (d) **Effect of Termination.** Upon termination of this Agreement for
+      any reason:
+      (i) Licensee shall immediately cease all use of the Software;
+      (ii) Licensee shall destroy all copies of the Software, Derivative
+      Works, Documentation, and Confidential Information in its possession
+      or control, and shall provide Licensor with written certification of
+      such destruction within thirty (30) days; and
+      (iii) All rights granted to Licensee under this Agreement shall
+      immediately cease, except for those provisions that by their nature
+      should survive termination (including Sections 5, 7, 8, 9, 11, and 12).
+
+---
+
+## 11. INDEMNIFICATION
+
+Licensee shall indemnify, defend, and hold harmless Licensor and the
+Associated Researchers from and against any claims, damages, losses,
+liabilities, costs, and expenses (including reasonable attorneys' fees)
+arising out of or relating to: (a) Licensee's use of the Software;
+(b) Licensee's breach of this Agreement; or (c) any claim that Licensee's
+use of the Software infringes the rights of any third party.
+
+---
+
+## 12. GENERAL PROVISIONS
+
+  (a) **Entire Agreement.** This Agreement constitutes the entire agreement
+      between the parties regarding the Software and supersedes all prior
+      negotiations, representations, and understandings, whether written
+      or oral, regarding the subject matter herein.
+
+  (b) **Amendments.** Any amendment or modification of this Agreement must
+      be in writing and signed by or acknowledged by both parties.
+
+  (c) **Assignment.** Licensee shall not assign, delegate, or otherwise
+      transfer this Agreement or any rights hereunder without the prior
+      written consent of Licensor. Any attempted assignment in violation
+      of this Section shall be null and void. Licensor may assign this
+      Agreement freely.
+
+  (d) **Governing Law.** This Agreement shall be governed by and construed
+      in accordance with the laws of the State of Texas, without regard to
+      its conflict-of-law principles.
+
+  (e) **Dispute Resolution.** Any dispute arising out of or relating to
+      this Agreement shall be resolved by binding arbitration administered
+      by the American Arbitration Association (AAA) under its Commercial
+      Arbitration Rules, with the arbitration conducted in Collin County,
+      Texas (McKinney, Texas). The Texas General Arbitration Act, Texas
+      Civil Practice and Remedies Code Chapter 171, shall apply. Judgment
+      on the award rendered by the arbitrator may be entered in any court
+      of competent jurisdiction. Notwithstanding the foregoing, either
+      party may seek injunctive or other equitable relief in any court of
+      competent jurisdiction located in Collin County, Texas, to protect
+      its intellectual property rights, without first submitting to
+      arbitration.
+
+  (f) **Severability.** If any provision of this Agreement is held to be
+      unenforceable or invalid, such provision shall be modified to the
+      minimum extent necessary to make it enforceable, and the remaining
+      provisions shall continue in full force and effect.
+
+  (g) **No Waiver.** No failure or delay by Licensor in exercising any
+      right under this Agreement shall constitute a waiver of that or any
+      other right.
+
+  (h) **Notices.** All notices under this Agreement shall be in writing
+      and sent to the contact information provided in the repository or
+      as otherwise designated by Licensor. Notices to Licensor may be sent
+      to: karthik.naidu.east@gmail.com.
+
+  (i) **Export Compliance.** Licensee shall comply with all applicable
+      export control laws and regulations in its use of the Software.
+
+  (j) **Government Rights.** If the Software was developed in part with
+      government funding, the government retains such rights as are
+      required by applicable law, and this Agreement is subject to those
+      reserved rights.
+
+  (k) **Headings.** Section headings are for convenience only and shall
+      not affect the interpretation of this Agreement.
+
+---
+
+## 13. ACKNOWLEDGMENT
+
+BY ACCESSING, CLONING, DOWNLOADING, INSTALLING, OR USING THE SOFTWARE,
+LICENSEE ACKNOWLEDGES THAT IT HAS READ THIS AGREEMENT, UNDERSTANDS IT,
+AND AGREES TO BE BOUND BY ITS TERMS AND CONDITIONS.
+
+IF LICENSEE DOES NOT AGREE TO THESE TERMS, LICENSEE SHALL NOT ACCESS,
+USE, COPY, OR DISTRIBUTE THE SOFTWARE.
+
+---
+
+**Copyright (c) 2026 Karthik Naidu and Associated Researchers. All rights
+reserved.**
+
+For licensing inquiries, contact: karthik.naidu.east@gmail.com
+
+
