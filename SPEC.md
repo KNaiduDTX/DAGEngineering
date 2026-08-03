@@ -196,7 +196,10 @@ on its output; otherwise the search continues. The demo predicate:
 > **INV-3.1.** Termination with reason `GOAL_SATISFIED` implies the goal
 > predicate returned true. A premature `GOAL` signal cannot end the run.
 
-Module: `steering.CoverageGoal`, checked in `scheduler.run`.
+Module: the `GoalPredicate` protocol (`steering`), checked in `scheduler.run`. The predicate
+is **injectable** — `CoverageGoal` for the brief task, `AnswerGoal` for GSM8K — and is the
+*only* task-specific coupling in the loop, so a new task is a predicate + a role fleet, not a
+scheduler change.
 
 ### 3.3 Constraint propagation (arc-consistency in miniature)
 
@@ -404,6 +407,7 @@ Module: `governor.CostGovernor`, `scheduler.run`.
 | INV-1.1 provenance-at-write (no NULLs) | `demo.py` GUARD 2 + PROVENANCE GAPS = none |
 | INV-2.1 emitted edges monotonic | construction trace shows strictly rising `gen` |
 | INV-3.1 goal predicate gates termination | `CoverageGoal.satisfied`; `test_budget_terminates_runaway` |
+| goal predicate is injectable (task-agnostic loop) | `test_gsm8k_goal_predicate_injectable` (`AnswerGoal` drives a GSM8K run) |
 | INV-4.1 typed completion signal | `Signal` enum; scheduler branches on `result.signal` only |
 | INV-6.1 acyclic at every prefix | `demo.py` GUARD 1 rejects the back-edge |
 | INV-7.1 four termination reasons | `demo.py` (goal) + `test_budget_terminates_runaway` (cap) + `test_cost_cap_enforced_within_a_wide_tick` (mid-tick budget) |
@@ -415,6 +419,7 @@ Module: `governor.CostGovernor`, `scheduler.run`.
 | retryable/terminal taxonomy; refusal not retried (§9) | `test_terminal_error_is_not_retried`; `test_openrouter_refusal_is_terminal` |
 | real ORCHESTRATOR: bounded plan + guaranteed coverage (§9) | `test_openrouter_orchestrator_plans_and_guarantees_coverage` |
 | cost-routing eval measures success vs cost (§9) | `test_eval_harness_ranks_policies_by_cost`; `test_eval_runs_mock_registry_offline` |
+| GSM8K eval: SSA iteration lifts accuracy; metrics + replay (§9) | `test_gsm8k_ssa_helps_vs_singlepass`; `test_gsm8k_eval_metrics_surface`; `test_gsm8k_judge_normalizes_answer` |
 | SSA write-once | `test_single_assignment_write_once` |
 
 Run `python demo.py` and `python test_invariants.py`; both assert these.
@@ -466,6 +471,15 @@ What changes, and nothing else does:
   All model calls are recorded activities with real token→$ cost; structured output +
   validate/repair land on the fail-closed guard (INV-4.2). GOAL/SYNTHESIZER stay mock.
   Run `python demo_ollama.py` (local) or `python eval_cost_routing.py` (cost routing).
+* **Standard-benchmark eval (GSM8K)** — the substrate pointed at grade-school math
+  (`tasks_gsm8k`): SOLVER/CHECKER/ANSWER roles over the same `chat`, run under two
+  configurations — **single-pass** (one shot) and **SSA-generational** (a CHECKER drives
+  refinement, each retry a new generation). The harness reports the paper's five numbers —
+  accuracy (does SSA iteration help?), **$ per correct answer** (the cost/quality frontier),
+  mean generations (the SSA metric), wall-clock under concurrency, and replay-equivalence
+  holding live during the eval. Correctness is graded by an exact-match **judge** on the
+  gold number; the goal predicate (`AnswerGoal`) only certifies an answer was produced, so
+  the DAG never sees the gold label. Run `python eval_gsm8k.py --data test.jsonl`.
 * **Idempotency keys** on external side-effecting Activities so replay/retry does
   not double-execute the world. *Done at the seam:* `Context.record(key, fn)` +
   `ACTIVITY_RECORDED` make each recorded step exactly-once across retries (§5.2).
@@ -488,14 +502,15 @@ What changes, and nothing else does:
 | `graph.py` | §1.1, §1.4, §6, lineage (§5, §8) |
 | `nodes.py` | §2.1, §2.3 (patch, placeholders) |
 | `activities.py` | §5.2 (recorded activities — replay/idempotency at the executor seam) |
-| `schemas.py` | §2.1, §9 (shared structured-output contracts: DRAFT/REVIEW/PLAN — flat, non-recursive) |
+| `schemas.py` | §2.1, §9 (shared structured-output contracts: DRAFT/REVIEW/PLAN + SOLUTION/VERIFY — flat, non-recursive) |
 | `executors.py` | §3.1, §4.1–4.2, §5.3, §9 (mock roles, critic loop, routing, retryable/terminal taxonomy) |
 | `roles.py` | §3.1, §4.1, §5.2–5.3, §9 (**single source** of the model-backed ENGINEER/REVIEWER/ORCHESTRATOR logic + prompts + the shared validate→repair loop, over an abstract `chat`; real retrieval SCOUT) |
 | `executors_ollama.py` | §3.1, §5.2 (native-Ollama `chat` — `format=` structured transport + registry; injectable call, offline-testable) |
 | `executors_openrouter.py` | §4.1, §5.2–5.3, §9 (OpenAI-compatible `chat` — raw-urllib transport + refusal/cost extract + registry; `max_retries=0` by construction; injectable transport) |
-| `evaluation.py` | §9 (cost-routing eval harness: policies, run_eval, cost_routing_report) |
-| `steering.py` | §3.2–3.4 (predicate, filter, beam, value) |
+| `tasks_gsm8k.py` | §9 (GSM8K as a DAG task: SOLVER/CHECKER/ANSWER roles + orchestrator over `chat`; single-pass & SSA registries; JSONL loader + exact-match judge) |
+| `evaluation.py` | §9 (eval harness: policies, run_eval; cost-routing report **and** GSM8K report — accuracy, $/correct, generations, wall-clock, replay) |
+| `steering.py` | §3.2–3.4 (**pluggable** goal predicate — `GoalPredicate` protocol, `CoverageGoal` / `AnswerGoal`; filter, beam, value) |
 | `governor.py` | §7 (bounds, retry budget) |
-| `scheduler.py` | §2.2, §5.4 (the loop) |
+| `scheduler.py` | §2.2, §5.4 (the loop; goal predicate is injectable — the one task-specific seam) |
 | `views.py` | §4.3, §5.2, §8 (blackboard, replay, lineage, cost report) |
-| `demo.py`, `demo_ollama.py`, `eval_cost_routing.py`, `test_invariants.py` | §8, §9 (executable proofs + live demos) |
+| `demo.py`, `demo_ollama.py`, `eval_cost_routing.py`, `eval_gsm8k.py`, `test_invariants.py` | §8, §9 (executable proofs + live demos) |

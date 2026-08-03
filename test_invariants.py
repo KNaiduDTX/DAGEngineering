@@ -7,6 +7,7 @@ Run:  python test_invariants.py
 import asyncio
 import json
 import random
+import re
 import threading
 
 from dyndag import (Budget, ExecutionResult, Executor, GraphProjection, NodeSpec,
@@ -688,6 +689,95 @@ def test_backpressure_bounds_in_flight():
     assert state["peak"] >= 2, f"no concurrency under the cap (peak={state['peak']})"
     ok, _, _ = verify_replay(store, r.graph, r.run_id)
     assert ok
+
+
+# --------------------------------------------------------------------------- #
+# GSM8K harness — single-pass vs SSA-generational, offline with a fake `chat`   #
+# --------------------------------------------------------------------------- #
+def _arith(q):
+    m = re.search(r"(\d+)\s+(plus|minus|times)\s+(\d+)", q)
+    a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
+    return {"plus": a + b, "minus": a - b, "times": a * b}[op]
+
+
+def _gsm_chat(first_wrong=False):
+    """A fake `chat` (the ChatJson seam): solves 'Compute A op B.' problems. With
+    first_wrong, the first pass (no critique yet) returns a wrong answer and a refinement
+    returns the right one; the checker verifies against its OWN recomputation (never gold)."""
+    def chat(messages, schema, name, required):
+        payload = json.loads(messages[-1]["content"])
+        if name == "solution":
+            correct = _arith(payload["problem"])
+            wrong = first_wrong and payload.get("critique_to_address") is None
+            ans = str(correct + 1000) if wrong else str(correct)
+            return {"content": {"reasoning": "work", "final_answer": ans},
+                    "usage": {"input_tokens": 10, "output_tokens": 5, "cost": 0.001}}
+        fa = str(payload["final_answer"])                       # verify
+        ok = fa == str(_arith(payload["problem"]))
+        return {"content": {"verified": ok, "confidence": 1.0 if ok else 0.1,
+                            "critique": "" if ok else "recompute"},
+                "usage": {"input_tokens": 8, "output_tokens": 3, "cost": 0.002}}
+    return chat
+
+
+def test_gsm8k_goal_predicate_injectable():
+    """A GSM8K goal (no subtopics/target_score) reaches GOAL_SATISFIED via an injected
+    AnswerGoal — proving the scheduler is no longer welded to CoverageGoal. Replay holds."""
+    from dyndag import gsm8k_registry, AnswerGoal
+    store = SQLiteEventStore(":memory:")
+    r = Scheduler(store, gsm8k_registry(_gsm_chat(), mode="single"), budget=Budget(),
+                  goal_predicate=AnswerGoal()).run({"question": "Compute 9 plus 9.", "problem_id": 0})
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    assert r.terminal_output["final_answer"] == "18", r.terminal_output
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
+
+
+def test_gsm8k_ssa_helps_vs_singlepass():
+    """The paper's core comparison, offline: a solver wrong on the first pass, correct after a
+    critique. Single-pass takes the wrong answer; SSA-generational iterates a NEW generation
+    and gets it right — accuracy 0/6 -> 6/6, generations 1 -> 2, replay holds throughout."""
+    from dyndag import gsm8k_registry, sample_tasks, run_eval, gsm8k_report
+    tasks = sample_tasks()
+    results = run_eval(tasks, {
+        "single-pass": lambda: gsm8k_registry(_gsm_chat(first_wrong=True), mode="single"),
+        "ssa":         lambda: gsm8k_registry(_gsm_chat(first_wrong=True), mode="ssa"),
+    })
+    sp = [results["single-pass"][t.name] for t in tasks]
+    ss = [results["ssa"][t.name] for t in tasks]
+    assert sum(t.success for t in sp) == 0, "single-pass should keep the wrong first answer"
+    assert sum(t.success for t in ss) == len(tasks), "SSA should refine to the correct answer"
+    assert all(t.generations == 1 for t in sp), [t.generations for t in sp]
+    assert all(t.generations >= 2 for t in ss), [t.generations for t in ss]
+    assert all(t.replay_ok for t in sp + ss), "replay-equivalence must hold during the eval"
+    rep = gsm8k_report(results)
+    assert "GSM8K EVAL" in rep and "$/correct" in rep, rep
+
+
+def test_gsm8k_eval_metrics_surface():
+    """Every paper metric surfaces on TaskResult / the report: accuracy, cost, $/correct,
+    generations, wall-clock, replay — over a perfect fake solver (6/6)."""
+    from dyndag import gsm8k_registry, sample_tasks, run_eval, accuracy, cost_per_correct
+    tasks = sample_tasks()
+    results = run_eval(tasks, {"ssa": lambda: gsm8k_registry(_gsm_chat(), mode="ssa")})
+    assert accuracy(results, "ssa") == (6, 6), accuracy(results, "ssa")
+    cpc = cost_per_correct(results, "ssa")
+    assert cpc is not None and cpc > 0, cpc
+    for t in results["ssa"].values():
+        assert t.generations >= 1 and t.wall_s >= 0.0 and t.replay_ok, t
+
+
+def test_gsm8k_judge_normalizes_answer():
+    """The exact-match judge normalizes formatting: '18', ' $18 ', '18.0' all match gold
+    '18'; '20' and a missing terminal do not — reading the structured final_answer, no regex."""
+    from dyndag.tasks_gsm8k import _make_judge
+    judge = _make_judge("18")
+
+    def _r(ans):
+        return type("R", (), {"terminal_output": {"kind": "solution", "final_answer": ans}})()
+    assert judge(_r("18")) and judge(_r(" $18 ")) and judge(_r("18.0"))
+    assert not judge(_r("20"))
+    assert not judge(type("R", (), {"terminal_output": None})())
 
 
 def main():

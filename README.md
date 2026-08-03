@@ -31,6 +31,7 @@ concurrency are done and merged; persistence is the remaining phase.
 | **0 — Harden substrate** | ✅ done | failure-path durability, fail-closed dispatch, mid-tick cost cap, execute/commit boundary; failure-injection + property sweeps |
 | **1 — Executor seam** | ✅ done | recorded-activity + idempotency; structured output + validate→repair; 4 real role-types (SCOUT/ORCHESTRATOR/ENGINEER/REVIEWER) across local + cloud; error taxonomy; real token→$ cost; cost-routing eval |
 | **2 — Concurrency** | ✅ done | parallel execute batch (thread pool + literal `asyncio.gather`); distributed workers pulling the frontier; backpressure |
+| **Eval — GSM8K** | 🟡 single-pass + SSA | accuracy (does SSA iteration help?), \$/correct, generation counts, wall-clock, replay-during-eval via an injectable goal predicate; self-consistency (φ-merge) arm next |
 | **3 — Persistence** | 🔴 next | Postgres `EventStore` adapter, snapshotting, resume-from-log (the `EventStore` ABC + recorded activities already lay the foundation) |
 
 ## What the demo shows (one run)
@@ -60,19 +61,22 @@ graph.py                fold-of-log projection, ready-set, acyclicity,         L
                         lineage, activity cache
 nodes.py                NodeSpec, SubgraphPatch, placeholder resolution        L2
 activities.py           recorded activities — exactly-once model calls/replay  L5
-schemas.py              shared structured-output contracts (DRAFT/REVIEW/PLAN) L2
+schemas.py              structured-output contracts (DRAFT/REVIEW/PLAN +       L2
+                        SOLUTION/VERIFY)
 executors.py            mock role executors, typed signals, ModelRouter,       L3 L4 L5
                         retryable/terminal error taxonomy
 roles.py                model-backed ENGINEER/REVIEWER/ORCHESTRATOR over an     L3 L4
                         abstract chat (one copy) + prompts + retrieval SCOUT
 executors_ollama.py     native-Ollama chat: format= transport + registry       L5
 executors_openrouter.py OpenAI-compatible chat: urllib transport, refusal+cost L4 L5
-steering.py             goal predicate, constraint filter, beam, value fn      L3
+tasks_gsm8k.py          GSM8K task: solver/checker/answer roles + single/ssa   L3
+                        registries, JSONL loader + exact-match judge
+steering.py             pluggable goal predicate, constraint filter, beam      L3
 governor.py             caps + GLOBAL retry budget                             L7
 scheduler.py            the loop: admit→execute→commit; batch / async /        L5
                         distributed-workers execution + backpressure
 views.py                blackboard, replay verify, lineage + cost report       L4 L5
-evaluation.py           cost-routing eval harness (policies, run_eval, report) L5
+evaluation.py           eval harness: cost-routing + GSM8K reports             L5
 ```
 
 ## Plugging in real models
@@ -103,6 +107,31 @@ exactly-once activities, with real token→$ cost. Run `python demo_ollama.py` (
 fleet) or `python eval_cost_routing.py` (the **cost-routing eval**: all-local vs
 all-cloud vs type-aware). Both skip cleanly when a provider isn't available; the
 offline `demo.py` / `test_invariants.py` never require any.
+
+## GSM8K evaluation
+
+The substrate pointed at a standard benchmark (`tasks_gsm8k.py`): grade-school math word
+problems, graded by exact match on the final number. SOLVER / CHECKER / ANSWER roles run over
+the same provider-agnostic `chat`, in two configurations:
+
+* **single-pass** — one solver, no critic.
+* **SSA-generational** — a CHECKER verifies the reasoning and, when unconvinced, emits a
+  *new generation* solver (`solver.g{k+1}`) fed the critique — iteration without a cycle.
+
+`eval_gsm8k.py` reports the five numbers the paper is built around: **accuracy** (does SSA
+iteration help?), **\$ per correct answer** (the cost/quality frontier), mean **generations**
+(the SSA-specific metric), mean **wall-clock** (latency under concurrency), and
+**replay-equivalence** holding live during the eval. The DAG never sees the gold answer — the
+goal predicate (`AnswerGoal`) only certifies that *an* answer survived the critic; correctness
+lives in the eval judge alone, so the graph can't cheat toward termination.
+
+```bash
+curl -sL https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl -o test.jsonl
+python eval_gsm8k.py --data test.jsonl --n 250 --configs single,ssa
+```
+
+Provider is auto-detected (Ollama or `OPENROUTER_API_KEY`) and skips cleanly when absent; with
+no `--data` it runs a tiny authored sample (plumbing smoke, not a benchmark number).
 
 ## Concurrency
 

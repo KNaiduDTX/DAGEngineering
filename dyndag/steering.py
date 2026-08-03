@@ -19,10 +19,18 @@ Three knobs turn a reactive graph into a goal-seeking one:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, Protocol
 
 from .graph import GraphProjection, NodeRecord
 from .nodes import NodeSpec
+
+
+class GoalPredicate(Protocol):
+    """The terminal test the scheduler applies to a GOAL-signalled node's output. A node
+    that raises Signal.GOAL is accepted as terminal ONLY if `satisfied` returns True;
+    otherwise the search continues. The scheduler is task-agnostic — it is parameterized by
+    a predicate, not welded to one (see Scheduler(goal_predicate=...))."""
+    def satisfied(self, terminal_output: dict) -> bool: ...
 
 
 @dataclass
@@ -39,6 +47,18 @@ class CoverageGoal:
         covered = set(terminal_output.get("covered", []))
         score_ok = terminal_output.get("final_score", 0.0) >= self.target_score
         return set(self.subtopics).issubset(covered) and score_ok
+
+
+class AnswerGoal:
+    """Goal predicate for question-answering tasks (e.g. GSM8K): the terminal candidate must
+    be a solution carrying a non-empty final answer. Correctness against a gold label is NOT
+    checked here — that is the eval judge's job. The DAG never sees the gold answer, so it
+    cannot 'cheat' toward termination; it only certifies that *an* answer was produced and
+    (on the SSA / self-consistency paths) survived the critic/merge."""
+    def satisfied(self, terminal_output: dict) -> bool:
+        if not isinstance(terminal_output, dict) or terminal_output.get("kind") != "solution":
+            return False
+        return str(terminal_output.get("final_answer", "")).strip() != ""
 
 
 def value_function(rec: NodeRecord) -> float:

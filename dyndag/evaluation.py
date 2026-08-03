@@ -15,13 +15,16 @@ the live `eval_cost_routing.py` wires it to real Ollama / OpenRouter fleets.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from .core import TerminationReason
+from .core import NodeType, TerminationReason
 from .governor import Budget
 from .scheduler import RunResult, Scheduler
+from .steering import GoalPredicate
 from .store import SQLiteEventStore
+from .views import verify_replay
 
 
 @dataclass
@@ -29,6 +32,7 @@ class EvalTask:
     name: str
     goal: dict
     judge: Optional[Callable[[RunResult], bool]] = None   # default: reached the goal
+    goal_predicate: Optional[GoalPredicate] = None        # None => scheduler's CoverageGoal
 
 
 @dataclass
@@ -42,6 +46,9 @@ class TaskResult:
     tokens_out: int
     ticks: int
     nodes: int
+    generations: int = 0        # SOLVER/ENGINEER attempts — the SSA-specific metric
+    wall_s: float = 0.0         # wall-clock of the run (latency under concurrency)
+    replay_ok: bool = True      # INV-5.2 verified live for this run (False on a crashed run)
     error: Optional[str] = None
 
 
@@ -66,20 +73,31 @@ DEFAULT_TASKS = [
 
 def run_task(task: EvalTask, registry: dict, max_workers: int = 1,
              budget: Optional[Budget] = None) -> TaskResult:
-    """Run one task under one registry (policy) and read metrics off the graph."""
+    """Run one task under one registry (policy) and read metrics off the graph. The task's
+    goal_predicate (e.g. GSM8K's AnswerGoal) is threaded into the scheduler; None keeps the
+    scheduler's default CoverageGoal. Wall-clock and replay-equivalence are measured here."""
     store = SQLiteEventStore(":memory:")
+    t0 = time.perf_counter()
     try:
-        r = Scheduler(store, registry, budget=budget or Budget(),
-                      max_workers=max_workers).run(dict(task.goal))
+        r = Scheduler(store, registry, budget=budget or Budget(), max_workers=max_workers,
+                      goal_predicate=task.goal_predicate).run(dict(task.goal))
     except Exception as exc:                       # provider down, etc. -> a failed run
-        return TaskResult(task.name, "?", False, "error", 0.0, 0, 0, 0, 0, error=repr(exc))
+        return TaskResult(task.name, "?", False, "error", 0.0, 0, 0, 0, 0,
+                          wall_s=round(time.perf_counter() - t0, 4), replay_ok=False,
+                          error=repr(exc))
+    wall_s = round(time.perf_counter() - t0, 4)
     success = task.judge(r) if task.judge else (r.reason == TerminationReason.GOAL_SATISFIED)
     nodes = r.graph.nodes.values()
     cost = sum(rec.cost_usd or 0.0 for rec in nodes)
     ti = sum((rec.usage or {}).get("input_tokens", 0) for rec in nodes)
     to = sum((rec.usage or {}).get("output_tokens", 0) for rec in nodes)
+    # generations = number of SOLVER/ENGINEER attempts: how many times the graph re-derived
+    # the answer (the SSA-specific metric). replay = INV-5.2, verified live per run.
+    generations = sum(1 for rec in nodes if rec.node_type == NodeType.ENGINEER)
+    replay_ok, _, _ = verify_replay(store, r.graph, r.run_id)
     return TaskResult(task.name, "?", success, r.reason.value, round(cost, 6),
-                      ti, to, r.ticks, len(r.graph.nodes))
+                      ti, to, r.ticks, len(r.graph.nodes),
+                      generations=generations, wall_s=wall_s, replay_ok=replay_ok)
 
 
 def run_eval(tasks: list, policies: dict, max_workers: int = 1) -> dict:
@@ -133,4 +151,46 @@ def cost_routing_report(results: dict) -> str:
             lines.append(f"  equal success ({full[cheapest][0]}/{full[cheapest][1]}): "
                          f"'{cheapest}' costs {pct}% less than '{dearest}' "
                          f"(${full[cheapest][2]:.6f} vs ${full[dearest][2]:.6f})")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# GSM8K report — accuracy vs the cost/quality frontier (the paper table)      #
+# --------------------------------------------------------------------------- #
+def accuracy(results: dict, policy: str) -> tuple:
+    """(correct, total) for a policy — success is the task's exact-match judge."""
+    rows = list(results[policy].values())
+    return sum(1 for t in rows if t.success), len(rows)
+
+
+def cost_per_correct(results: dict, policy: str) -> Optional[float]:
+    """Total $ spent divided by correct answers — the cost/quality frontier point. None when
+    the policy got nothing right (cost per correct is undefined)."""
+    rows = list(results[policy].values())
+    correct = sum(1 for t in rows if t.success)
+    if correct == 0:
+        return None
+    return round(sum(t.cost_usd for t in rows) / correct, 6)
+
+
+def gsm8k_report(results: dict) -> str:
+    """The paper's evaluation table: per policy — accuracy, total cost, **cost per correct
+    answer** (the frontier), mean **generations** (does SSA iteration help?), mean **wall
+    clock** (latency under concurrency), and **replay-equivalence** over the runs that
+    executed (INV-5.2 holding in practice, live during the eval)."""
+    lines = ["GSM8K EVAL",
+             f"  {'policy':<16}{'accuracy':<12}{'cost $':<12}{'$/correct':<12}"
+             f"{'gen(avg)':<10}{'wall s(avg)':<13}{'replay'}"]
+    for pname, trs in results.items():
+        rows = list(trs.values())
+        ran = [t for t in rows if t.error is None]         # exclude crashed runs (no graph)
+        corr, tot = accuracy(results, pname)
+        cost = sum(t.cost_usd for t in rows)
+        cpc = cost_per_correct(results, pname)
+        cpc_s = f"{cpc:.6f}" if cpc is not None else "n/a"
+        gen_avg = (sum(t.generations for t in ran) / len(ran)) if ran else 0.0
+        wall_avg = (sum(t.wall_s for t in ran) / len(ran)) if ran else 0.0
+        rok = sum(1 for t in ran if t.replay_ok)
+        lines.append(f"  {pname:<16}{f'{corr}/{tot}':<12}{f'{cost:.6f}':<12}{cpc_s:<12}"
+                     f"{gen_avg:<10.2f}{wall_avg:<13.4f}{rok}/{len(ran)} ok")
     return "\n".join(lines)
