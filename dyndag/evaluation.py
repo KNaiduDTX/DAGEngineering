@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from math import comb
 from typing import Callable, Optional
 
 from .core import NodeType, TerminationReason
@@ -194,3 +195,60 @@ def gsm8k_report(results: dict) -> str:
         lines.append(f"  {pname:<16}{f'{corr}/{tot}':<12}{f'{cost:.6f}':<12}{cpc_s:<12}"
                      f"{gen_avg:<10.2f}{wall_avg:<13.4f}{rok}/{len(ran)} ok")
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Paired analysis — the right test when every policy ran the SAME problems     #
+# --------------------------------------------------------------------------- #
+def _mcnemar_p(b: int, c: int) -> float:
+    """Exact two-sided McNemar p-value on discordant counts (b, c): under H0 each discordant
+    pair is a fair coin, so p = 2·P(X ≤ min(b,c) | Binom(b+c, 0.5)), capped at 1."""
+    n = b + c
+    if n == 0:
+        return 1.0
+    k = min(b, c)
+    tail = sum(comb(n, i) for i in range(k + 1)) * (0.5 ** n)
+    return min(1.0, 2.0 * tail)
+
+
+def mcnemar(results: dict, a: str, b: str) -> tuple:
+    """Paired McNemar for two policies over the SHARED task set. Returns (a_only, b_only, p):
+    a_only = tasks `a` got right and `b` wrong, b_only the reverse (the discordant pairs — the
+    only ones that carry signal), and p the exact two-sided p-value. Far more powerful than
+    comparing marginal accuracy rates, because it controls for per-problem difficulty."""
+    ta, tb = results[a], results[b]
+    keys = [k for k in ta if k in tb]
+    a_only = sum(1 for k in keys if ta[k].success and not tb[k].success)
+    b_only = sum(1 for k in keys if tb[k].success and not ta[k].success)
+    return a_only, b_only, _mcnemar_p(a_only, b_only)
+
+
+def paired_report(results: dict) -> str:
+    """Pairwise paired comparison (McNemar) across all policies on the shared task set, with a
+    note when one policy's correct set strictly contains the other's (strict domination)."""
+    pols = list(results)
+    lines = ["PAIRED COMPARISON (McNemar on shared tasks; only discordant pairs count)"]
+    for i in range(len(pols)):
+        for j in range(i + 1, len(pols)):
+            a, b = pols[i], pols[j]
+            ao, bo, p = mcnemar(results, a, b)
+            dom = ""
+            if ao == 0 and bo > 0:
+                dom = f"   [{b} strictly dominates {a}]"
+            elif bo == 0 and ao > 0:
+                dom = f"   [{a} strictly dominates {b}]"
+            lines.append(f"  {a:<10} vs {b:<10}  {a}-only={ao:<3} {b}-only={bo:<3} p={p:.4f}{dom}")
+    return "\n".join(lines)
+
+
+def per_problem_rows(results: dict) -> list:
+    """Flatten to per-(policy, task) rows for dumping — the raw material for a paired analysis
+    or an audit of which problems each policy got right."""
+    rows = []
+    for pname, trs in results.items():
+        for t in trs.values():
+            rows.append({"policy": pname, "task": t.task, "success": t.success,
+                         "reason": t.reason, "generations": t.generations,
+                         "cost_usd": t.cost_usd, "wall_s": t.wall_s,
+                         "replay_ok": t.replay_ok, "error": t.error})
+    return rows

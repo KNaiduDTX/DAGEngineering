@@ -865,6 +865,77 @@ def test_gsm8k_self_consistency_beats_singlepass():
     assert results["sc"]["q"].success is True, "self-consistency should outvote the wrong sample"
 
 
+# --------------------------------------------------------------------------- #
+# Combined arm (φ-of-SSA) + paired analysis                                    #
+# --------------------------------------------------------------------------- #
+def _combined_chat(initials):
+    """Fake `chat` for the combined arm: an initial solve returns the next preset answer; a
+    refinement (a critique is present) converges to '42'; the critic always asks to reconsider
+    (so every lineage gets refined)."""
+    box = {"i": 0}
+    def chat(messages, schema, name, required):
+        payload = json.loads(messages[-1]["content"])
+        u = {"input_tokens": 5, "output_tokens": 2, "cost": 0.0}
+        if name == "solution":
+            if payload.get("critique_to_address"):
+                return {"content": {"reasoning": "fixed", "final_answer": "42"}, "usage": u}
+            a = initials[box["i"] % len(initials)]
+            box["i"] += 1
+            return {"content": {"reasoning": "first", "final_answer": str(a)}, "usage": u}
+        return {"content": {"verified": False, "confidence": 0.5, "critique": "reconsider"},
+                "usage": u}
+    return chat
+
+
+def test_gsm8k_combined_refines_then_merges():
+    """The compositional φ-of-SSA arm: K lineages, each refined (solver->critic->solver), then
+    φ-merged. Runs end-to-end, is terminal via the φ-node, has 2K solver nodes, replays clean."""
+    from dyndag import gsm8k_registry, AnswerGoal
+    store = SQLiteEventStore(":memory:")
+    reg = gsm8k_registry(_combined_chat(["1", "2", "42"]), mode="combined", k=3, r=1)
+    r = Scheduler(store, reg, budget=Budget(), goal_predicate=AnswerGoal()).run(
+        {"question": "q", "problem_id": 0})
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    assert r.terminal_output.get("phi", {}).get("policy") == "majority_vote", r.terminal_output
+    assert r.terminal_output["final_answer"] == "42", r.terminal_output
+    n_solver = sum(1 for rec in r.graph.nodes.values() if rec.node_type == NodeType.ENGINEER)
+    assert n_solver == 6, n_solver                        # 2K = 2 * 3 (one refinement each)
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok, "replay diverged with the combined arm"
+
+
+def test_gsm8k_combined_beats_sc_when_refinement_helps():
+    """The compositional claim, offline: three samples [1,2,42] with no majority — sc ties and
+    takes the wrong one; the combined arm REFINES each line to 42 first, so the φ-merge is
+    correct. Refine-then-merge > merge-alone."""
+    from dyndag import gsm8k_registry, EvalTask, run_eval, AnswerGoal
+    task = EvalTask("t", {"question": "q", "problem_id": 0},
+                    judge=lambda rr: (rr.terminal_output or {}).get("final_answer") == "42",
+                    goal_predicate=AnswerGoal())
+    res = run_eval([task], {
+        "sc": lambda: gsm8k_registry(_combined_chat(["1", "2", "42"]), mode="sc", k=3),
+        "combined": lambda: gsm8k_registry(_combined_chat(["1", "2", "42"]),
+                                           mode="combined", k=3, r=1),
+    })
+    assert res["sc"]["t"].success is False, "sc should tie to the wrong answer"
+    assert res["combined"]["t"].success is True, "combined should refine to the right answer"
+
+
+def test_mcnemar_paired_and_domination():
+    """The paired McNemar helper: counts discordant pairs, computes an exact p in (0,1], and
+    flags strict domination when one policy's correct set contains the other's."""
+    from dyndag import mcnemar, paired_report
+
+    def _res(successes):
+        return {k: type("T", (), {"success": v})() for k, v in successes.items()}
+    results = {"A": _res({"t0": True, "t1": True, "t2": True}),
+               "B": _res({"t0": True, "t1": False, "t2": False})}
+    a_only, b_only, p = mcnemar(results, "A", "B")
+    assert (a_only, b_only) == (2, 0), (a_only, b_only)
+    assert 0.0 < p <= 1.0, p
+    assert "strictly dominates" in paired_report(results)
+
+
 def main():
     tests = [v for k, v in globals().items() if k.startswith("test_")]
     for t in tests:

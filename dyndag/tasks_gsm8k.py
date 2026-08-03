@@ -52,7 +52,14 @@ class SolverRole(_LlmRole):
     def run(self, inputs, params, ctx) -> ExecutionResult:
         revision = params.get("revision", 0)
         question = params["question"]
+        # Critique reaches a refinement either in params (the ADAPTIVE SSA path — the checker
+        # knows it when it emits the refined solver) or in an input node (the pre-unrolled
+        # combined path — a critic node produced it at runtime).
         critique = params.get("critique")
+        if critique is None:
+            crit = next((v for v in inputs.values()
+                         if isinstance(v, dict) and v.get("kind") == "critique"), None)
+            critique = crit.get("critique") if crit else None
         prior = next((v for v in inputs.values()
                       if isinstance(v, dict) and v.get("kind") == "solution"), None)
         messages = [
@@ -136,6 +143,39 @@ class CheckerRole(_LlmRole):
             patch=SubgraphPatch(added_nodes=[refined, re_check]))
 
 
+class CritiqueRole(_LlmRole):
+    """A PURE critic (bound to REVIEWER in the combined φ-of-SSA arm): scores a solution's
+    reasoning and returns a one-line critique, emitting NO patch — the refinement structure is
+    pre-unrolled by the orchestrator (the substrate can't grow a φ's fan-in adaptively, so the
+    depth is fixed). Contrast `CheckerRole`, which DRIVES an adaptive loop by emitting nodes.
+    Its output `kind` is "critique" so the next solver reads it as feedback, not as a prior
+    solution."""
+
+    def run(self, inputs, params, ctx) -> ExecutionResult:
+        solution = next(v for v in inputs.values()
+                        if isinstance(v, dict) and v.get("kind") == "solution")
+        sol_id = next(k for k, v in inputs.items() if v is solution)
+        messages = [
+            {"role": "system", "content": (
+                "You are a strict math checker. Decide whether the solution's reasoning is "
+                "correct and internally consistent for the problem, and give a one-line "
+                "critique naming any error to fix. Return verified (bool), confidence 0.0-1.0, "
+                "and the critique. Respond with JSON only.")},
+            {"role": "user", "content": json.dumps({
+                "problem": solution["question"], "reasoning": solution.get("reasoning", ""),
+                "final_answer": solution.get("final_answer", "")})},
+        ]
+        recorded = ctx.record(f"critique_{sol_id}",
+                              lambda: self.chat(messages, VERIFY_SCHEMA, "verify",
+                                                ("verified", "confidence")))
+        data, usage = recorded["content"], recorded.get("usage")
+        confidence = max(0.0, min(1.0, float(data.get("confidence", 0.0))))
+        return ExecutionResult(output={
+            "kind": "critique", "verified": bool(data.get("verified")),
+            "confidence": round(confidence, 3), "critique": str(data.get("critique", "")),
+        }, signal=Signal.CONTINUE, score=confidence, usage=usage)
+
+
 class AnswerExecutor(Executor):
     """Finalizer (bound to SYNTHESIZER — aggregation). Emits the terminal solution
     (Signal.GOAL); the scheduler then applies AnswerGoal. Pure: it forwards the single chosen
@@ -156,16 +196,24 @@ class GsmOrchestrator(Executor):
     """The GSM8K expander (bound to ORCHESTRATOR). Deterministic — no model, no cost: GSM8K
     planning is fixed. Reads the question from the goal and emits the initial subgraph for the
     chosen `mode`:
-      single => solver -> answer                   (one pass, no critic)
-      ssa    => solver -> checker                  (the checker drives the SSA refinement loop)
-      sc     => solver_0..solver_{k-1} -> phi       (self-consistency: K samples, φ majority-vote)
+      single   => solver -> answer                    (one pass, no critic)
+      ssa      => solver -> checker                   (the checker drives the ADAPTIVE SSA loop)
+      sc       => solver_0..k-1 -> phi                (self-consistency: K samples, φ majority-vote)
+      combined => [solver->critic->solver]_0..k-1 -> phi  (φ-of-SSA: K refined lineages, merged)
+
+    `combined` is the compositional arm — refine EACH of K competing lines, THEN merge. Each
+    lineage is a FIXED `r` rounds of solver->critic->refined-solver (statically unrolled,
+    because the substrate can't grow a φ's fan-in over adaptively-deep lineages — edges are
+    stamped at creation under generation monotonicity).
     """
 
-    def __init__(self, mode: str = "ssa", k: int = 5):
-        if mode not in ("single", "ssa", "sc"):
-            raise ValueError(f"unknown GSM8K mode {mode!r} (expected 'single', 'ssa' or 'sc')")
+    def __init__(self, mode: str = "ssa", k: int = 5, r: int = 1):
+        if mode not in ("single", "ssa", "sc", "combined"):
+            raise ValueError(
+                f"unknown GSM8K mode {mode!r} (expected 'single', 'ssa', 'sc' or 'combined')")
         self.mode = mode
         self.k = max(1, int(k))
+        self.r = max(1, int(r))           # refinement rounds per lineage (combined)
 
     def run(self, inputs, params, ctx) -> ExecutionResult:
         goal = ctx.goal if isinstance(ctx.goal, dict) else {}
@@ -184,6 +232,32 @@ class GsmOrchestrator(Executor):
                 output={"mode": "sc", "plan": [s.key for s in solvers] + ["phi"]},
                 signal=Signal.CONTINUE, patch=SubgraphPatch(added_nodes=[*solvers, phi]))
 
+        if self.mode == "combined":
+            # K competing lineages, each refined `r` rounds (solver -> critic -> refined solver),
+            # then φ majority-vote over the K refined solutions. Fully unrolled: fan-in is over
+            # fixed keys (solver_i_r), the only shape the substrate's static construction allows.
+            nodes: list = []
+            refined: list = []
+            for i in range(self.k):
+                prev = NodeSpec(key=f"solver_{i}_0", node_type=NodeType.ENGINEER,
+                                input_keys=(ctx.self_id,),
+                                params={"question": question, "revision": 0, "sample": i})
+                nodes.append(prev)
+                for j in range(self.r):
+                    critic = NodeSpec(key=f"critic_{i}_{j}", node_type=NodeType.REVIEWER,
+                                      input_keys=(prev.key,), params={})
+                    nxt = NodeSpec(key=f"solver_{i}_{j + 1}", node_type=NodeType.ENGINEER,
+                                   input_keys=(prev.key, critic.key),
+                                   params={"question": question, "revision": j + 1, "sample": i})
+                    nodes += [critic, nxt]
+                    prev = nxt
+                refined.append(prev.key)
+            phi = NodeSpec(key="phi", node_type=NodeType.PHI, input_keys=tuple(refined), params={})
+            nodes.append(phi)
+            return ExecutionResult(
+                output={"mode": "combined", "plan": [n.key for n in nodes]},
+                signal=Signal.CONTINUE, patch=SubgraphPatch(added_nodes=nodes))
+
         solver = NodeSpec(key="solver", node_type=NodeType.ENGINEER,
                           input_keys=(ctx.self_id,),
                           params={"question": question, "revision": 0})
@@ -201,19 +275,24 @@ class GsmOrchestrator(Executor):
 # --------------------------------------------------------------------------- #
 # Registry (policy) factory                                                   #
 # --------------------------------------------------------------------------- #
-def gsm8k_registry(chat: ChatJson, mode: str = "ssa", k: int = 5,
+def gsm8k_registry(chat: ChatJson, mode: str = "ssa", k: int = 5, r: int = 1,
                    target_confidence: float = 0.9, max_revision: int = 3) -> dict:
     """A registry (eval policy) for GSM8K over a provider-agnostic `chat`. SOLVER=ENGINEER
     (local tier), CHECKER=REVIEWER (cloud tier) — so the cost router's split applies for free.
-    `mode` selects single-pass, SSA-generational, or self-consistency ('sc', `k` samples merged
-    by a φ-node majority-vote). GOAL/SCOUT stay mock (GSM8K emits no SCOUT)."""
+    `mode` selects single-pass, SSA-generational ('ssa'), self-consistency ('sc', `k` samples
+    merged by a φ majority-vote), or the compositional 'combined' arm (`k` lineages each refined
+    `r` rounds, then φ-merged). `combined` uses a PURE critic (no adaptive patching); the others
+    use the adaptive CheckerRole. GOAL/SCOUT stay mock (GSM8K emits no SCOUT)."""
     registry = default_registry()
-    registry[NodeType.ORCHESTRATOR] = GsmOrchestrator(mode=mode, k=k)
+    registry[NodeType.ORCHESTRATOR] = GsmOrchestrator(mode=mode, k=k, r=r)
     registry[NodeType.ENGINEER] = SolverRole(chat)
-    registry[NodeType.REVIEWER] = CheckerRole(chat, target_confidence=target_confidence,
-                                              max_revision=max_revision)
+    if mode == "combined":
+        registry[NodeType.REVIEWER] = CritiqueRole(chat)          # pure critic, pre-unrolled
+    else:
+        registry[NodeType.REVIEWER] = CheckerRole(chat, target_confidence=target_confidence,
+                                                  max_revision=max_revision)
     registry[NodeType.SYNTHESIZER] = AnswerExecutor()
-    # φ-merge over the K competing solver samples: majority-vote on final_answer, terminal.
+    # φ-merge over the K competing (refined) solutions: majority-vote on final_answer, terminal.
     registry[NodeType.PHI] = PhiExecutor(majority_vote("final_answer"),
                                          signal=Signal.GOAL, kind="solution")
     return registry
