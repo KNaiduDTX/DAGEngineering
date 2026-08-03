@@ -30,7 +30,7 @@ from dyndag.executors_openrouter import openrouter_chat
 
 OLLAMA_V1 = "http://localhost:11434/v1"
 OPENROUTER_V1 = "https://openrouter.ai/api/v1"
-_KNOWN = ("single", "ssa")          # self-consistency ('sc') arrives with the PHI node
+_KNOWN = ("single", "ssa", "sc")    # sc = self-consistency (K samples, φ majority-vote)
 
 
 def _ollama_up() -> bool:
@@ -43,14 +43,17 @@ def _ollama_up() -> bool:
         return False
 
 
-def _pick_chat(local_model: str, cloud_model: str):
-    """One `chat` for all policies (the comparison is strategy, not provider). Prefer cloud
-    when a key is set, else a local Ollama endpoint via its OpenAI-compatible /v1."""
+def _chat_factory(local_model: str, cloud_model: str):
+    """Return (make_chat(temperature)->chat, provider_str) or (None, None). ONE provider for
+    all policies (the comparison is strategy, not provider); self-consistency draws its `chat`
+    with a temperature so its K samples differ, while single/ssa stay greedy."""
     key = os.environ.get("OPENROUTER_API_KEY")
     if key:
-        return openrouter_chat(model=cloud_model, base_url=OPENROUTER_V1, api_key=key), f"cloud:{cloud_model}"
+        return (lambda t=None: openrouter_chat(model=cloud_model, base_url=OPENROUTER_V1,
+                                               api_key=key, temperature=t)), f"cloud:{cloud_model}"
     if _ollama_up():
-        return openrouter_chat(model=local_model, base_url=OLLAMA_V1, api_key="ollama"), f"local:{local_model}"
+        return (lambda t=None: openrouter_chat(model=local_model, base_url=OLLAMA_V1,
+                                               api_key="ollama", temperature=t)), f"local:{local_model}"
     return None, None
 
 
@@ -59,7 +62,10 @@ def main() -> None:
     ap.add_argument("--data", default=None, help="GSM8K test.jsonl (omit => authored sample set)")
     ap.add_argument("--n", type=int, default=250, help="random subset size (with --seed)")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--configs", default="single,ssa", help="comma list of: single, ssa")
+    ap.add_argument("--configs", default="single,ssa,sc", help="comma list of: single, ssa, sc")
+    ap.add_argument("--k", type=int, default=5, help="self-consistency samples (sc mode)")
+    ap.add_argument("--sc-temperature", type=float, default=0.8,
+                    help="sampling temperature for sc solvers (diversity)")
     ap.add_argument("--local-model", default="llama3.2")
     ap.add_argument("--cloud-model", default="openai/gpt-4o-mini")
     ap.add_argument("--max-workers", type=int, default=1, help="WIP cap per task (concurrency)")
@@ -68,12 +74,11 @@ def main() -> None:
     configs = [c.strip() for c in args.configs.split(",") if c.strip()]
     unknown = [c for c in configs if c not in _KNOWN]
     if unknown:
-        print(f"[skip] unknown configs {unknown}; known: {list(_KNOWN)} "
-              f"(self-consistency 'sc' arrives with the PHI node).")
+        print(f"[skip] unknown configs {unknown}; known: {list(_KNOWN)}.")
         return
 
-    chat, provider = _pick_chat(args.local_model, args.cloud_model)
-    if chat is None:
+    make_chat, provider = _chat_factory(args.local_model, args.cloud_model)
+    if make_chat is None:
         print("[skip] no provider available.")
         print("       Start Ollama (`ollama serve` + `ollama pull llama3.2`) or set "
               "OPENROUTER_API_KEY, then re-run.")
@@ -81,9 +86,15 @@ def main() -> None:
 
     tasks = load_gsm8k(args.data, n=args.n, seed=args.seed) if args.data else sample_tasks()
     source = args.data or "authored-sample"
-    policies = {c: (lambda c=c: gsm8k_registry(chat, mode=c)) for c in configs}
 
-    print(f"provider={provider}  data={source}  tasks={len(tasks)}  configs={configs}\n")
+    def _registry_for(c):
+        if c == "sc":                                    # sampled solvers so the K samples differ
+            return gsm8k_registry(make_chat(args.sc_temperature), mode="sc", k=args.k)
+        return gsm8k_registry(make_chat(None), mode=c)   # greedy for single / ssa
+    policies = {c: (lambda c=c: _registry_for(c)) for c in configs}
+
+    print(f"provider={provider}  data={source}  tasks={len(tasks)}  configs={configs}"
+          f"{f'  k={args.k}' if 'sc' in configs else ''}\n")
     results = run_eval(tasks, policies, max_workers=args.max_workers)
     print(gsm8k_report(results))
 

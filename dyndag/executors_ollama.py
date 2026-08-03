@@ -29,8 +29,9 @@ def _usage_of(resp) -> dict:
             "output_tokens": get("eval_count") or 0}
 
 
-def _native_call(model: str, host: Optional[str]) -> ChatOnce:
-    """A single structured call over the native `ollama` package (lazy import)."""
+def _native_call(model: str, host: Optional[str], temperature: Optional[float] = None) -> ChatOnce:
+    """A single structured call over the native `ollama` package (lazy import). `temperature`
+    (when set) samples via Ollama's `options` — needed for self-consistency diversity."""
     def call_once(messages, schema, name):     # `name` unused — native format= has no schema name
         try:
             import ollama
@@ -39,18 +40,19 @@ def _native_call(model: str, host: Optional[str]) -> ChatOnce:
                 f"ollama not installed — `pip install ollama`, run `ollama serve`, "
                 f"and `ollama pull {model}`") from exc
         client = ollama.Client(host=host) if host else ollama
-        resp = client.chat(model=model, messages=messages, format=schema)
+        kwargs = {"options": {"temperature": temperature}} if temperature is not None else {}
+        resp = client.chat(model=model, messages=messages, format=schema, **kwargs)
         content = resp["message"]["content"] if isinstance(resp, dict) else resp.message.content
         return content, _usage_of(resp)
     return call_once
 
 
 def ollama_chat(model: str = "llama3.2", host: Optional[str] = None, repair_attempts: int = 2,
-                call: Optional[ChatOnce] = None) -> ChatJson:
+                call: Optional[ChatOnce] = None, temperature: Optional[float] = None) -> ChatJson:
     """A provider-agnostic `chat` backed by native Ollama (structured output via `format=`).
     Pass `call=` a fake single-call primitive to unit-test the repair loop + roles offline
-    (no `ollama` package, no server)."""
-    call_once = call or _native_call(model, host)
+    (no `ollama` package, no server). `temperature` samples (needed for self-consistency)."""
+    call_once = call or _native_call(model, host, temperature=temperature)
 
     def chat(messages, schema, name, required):
         return chat_json_with_repair(call_once, messages, schema, name, required, repair_attempts)

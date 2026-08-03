@@ -35,6 +35,7 @@ from typing import Optional
 from .core import NodeType, Signal
 from .executors import Executor, ExecutionResult, default_registry
 from .nodes import NodeSpec, SubgraphPatch
+from .phi import PhiExecutor, majority_vote
 from .roles import ChatJson, _LlmRole
 from .schemas import SOLUTION_SCHEMA, VERIFY_SCHEMA
 from .steering import AnswerGoal
@@ -155,18 +156,34 @@ class GsmOrchestrator(Executor):
     """The GSM8K expander (bound to ORCHESTRATOR). Deterministic — no model, no cost: GSM8K
     planning is fixed. Reads the question from the goal and emits the initial subgraph for the
     chosen `mode`:
-      single => solver -> answer     (one pass, no critic)
-      ssa    => solver -> checker    (the checker drives the SSA refinement loop)
+      single => solver -> answer                   (one pass, no critic)
+      ssa    => solver -> checker                  (the checker drives the SSA refinement loop)
+      sc     => solver_0..solver_{k-1} -> phi       (self-consistency: K samples, φ majority-vote)
     """
 
-    def __init__(self, mode: str = "ssa"):
-        if mode not in ("single", "ssa"):
-            raise ValueError(f"unknown GSM8K mode {mode!r} (expected 'single' or 'ssa')")
+    def __init__(self, mode: str = "ssa", k: int = 5):
+        if mode not in ("single", "ssa", "sc"):
+            raise ValueError(f"unknown GSM8K mode {mode!r} (expected 'single', 'ssa' or 'sc')")
         self.mode = mode
+        self.k = max(1, int(k))
 
     def run(self, inputs, params, ctx) -> ExecutionResult:
         goal = ctx.goal if isinstance(ctx.goal, dict) else {}
         question = goal.get("question", "")
+
+        if self.mode == "sc":
+            # K sibling solvers (distinct ids => K independent, individually-recorded samples
+            # => diverse under temperature, yet replay-stable) fan into one φ-merge.
+            solvers = [NodeSpec(key=f"solver_{i}", node_type=NodeType.ENGINEER,
+                                input_keys=(ctx.self_id,),
+                                params={"question": question, "revision": 0, "sample": i})
+                       for i in range(self.k)]
+            phi = NodeSpec(key="phi", node_type=NodeType.PHI,
+                           input_keys=tuple(s.key for s in solvers), params={})
+            return ExecutionResult(
+                output={"mode": "sc", "plan": [s.key for s in solvers] + ["phi"]},
+                signal=Signal.CONTINUE, patch=SubgraphPatch(added_nodes=[*solvers, phi]))
+
         solver = NodeSpec(key="solver", node_type=NodeType.ENGINEER,
                           input_keys=(ctx.self_id,),
                           params={"question": question, "revision": 0})
@@ -184,17 +201,21 @@ class GsmOrchestrator(Executor):
 # --------------------------------------------------------------------------- #
 # Registry (policy) factory                                                   #
 # --------------------------------------------------------------------------- #
-def gsm8k_registry(chat: ChatJson, mode: str = "ssa", target_confidence: float = 0.9,
-                   max_revision: int = 3) -> dict:
+def gsm8k_registry(chat: ChatJson, mode: str = "ssa", k: int = 5,
+                   target_confidence: float = 0.9, max_revision: int = 3) -> dict:
     """A registry (eval policy) for GSM8K over a provider-agnostic `chat`. SOLVER=ENGINEER
     (local tier), CHECKER=REVIEWER (cloud tier) — so the cost router's split applies for free.
-    `mode` selects single-pass or SSA-generational; GOAL/SCOUT stay mock (GSM8K emits no SCOUT)."""
+    `mode` selects single-pass, SSA-generational, or self-consistency ('sc', `k` samples merged
+    by a φ-node majority-vote). GOAL/SCOUT stay mock (GSM8K emits no SCOUT)."""
     registry = default_registry()
-    registry[NodeType.ORCHESTRATOR] = GsmOrchestrator(mode=mode)
+    registry[NodeType.ORCHESTRATOR] = GsmOrchestrator(mode=mode, k=k)
     registry[NodeType.ENGINEER] = SolverRole(chat)
     registry[NodeType.REVIEWER] = CheckerRole(chat, target_confidence=target_confidence,
                                               max_revision=max_revision)
     registry[NodeType.SYNTHESIZER] = AnswerExecutor()
+    # φ-merge over the K competing solver samples: majority-vote on final_answer, terminal.
+    registry[NodeType.PHI] = PhiExecutor(majority_vote("final_answer"),
+                                         signal=Signal.GOAL, kind="solution")
     return registry
 
 

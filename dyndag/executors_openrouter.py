@@ -41,12 +41,14 @@ def _json_schema_format(name: str, schema: dict) -> dict:
     return {"type": "json_schema", "json_schema": {"name": name, "strict": True, "schema": schema}}
 
 
-def http_transport(base_url: str, api_key: Optional[str], timeout: float = 60.0) -> Transport:
+def http_transport(base_url: str, api_key: Optional[str], timeout: float = 60.0,
+                   temperature: Optional[float] = None) -> Transport:
     """A raw-urllib transport for an OpenAI-compatible `/chat/completions` endpoint.
     No SDK, no retries. 429 / 5xx / network -> retryable RuntimeError; 4xx / no-key ->
     TerminalExecutionError. The key is read once here (arg or OPENROUTER_API_KEY /
     OPENAI_API_KEY); a missing key only fails when the transport is actually called, so
-    building a registry offline is fine."""
+    building a registry offline is fine. `temperature` (when set) samples — needed for
+    self-consistency, where K solvers must draw DIFFERENT reasoning paths."""
     key = api_key or os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
 
     def _call(model: str, messages: list, response_format: Optional[dict]) -> dict:
@@ -55,6 +57,8 @@ def http_transport(base_url: str, api_key: Optional[str], timeout: float = 60.0)
         if not key:
             raise TerminalExecutionError("no API key — set OPENROUTER_API_KEY (or pass api_key=)")
         body = {"model": model, "messages": messages, "usage": {"include": True}}
+        if temperature is not None:
+            body["temperature"] = temperature
         if response_format is not None:
             body["response_format"] = response_format
         req = urllib.request.Request(
@@ -108,11 +112,14 @@ def _openai_call(model: str, transport: Transport) -> ChatOnce:
 
 def openrouter_chat(model: str = "openai/gpt-4o-mini", base_url: str = OPENROUTER_BASE_URL,
                     api_key: Optional[str] = None, repair_attempts: int = 2,
-                    transport: Optional[Transport] = None) -> ChatJson:
+                    transport: Optional[Transport] = None,
+                    temperature: Optional[float] = None) -> ChatJson:
     """A provider-agnostic `chat` over the OpenAI-compatible API (OpenRouter default).
     Pass `transport=` a fake to unit-test the repair loop + roles offline, or point
-    `base_url` at any OpenAI-compatible endpoint (e.g. Ollama's /v1)."""
-    call_once = _openai_call(model, transport or http_transport(base_url, api_key))
+    `base_url` at any OpenAI-compatible endpoint (e.g. Ollama's /v1). `temperature` samples
+    (needed for self-consistency); it is ignored when a `transport` is injected."""
+    call_once = _openai_call(model, transport or http_transport(base_url, api_key,
+                                                                temperature=temperature))
 
     def chat(messages, schema, name, required):
         return chat_json_with_repair(call_once, messages, schema, name, required, repair_attempts)

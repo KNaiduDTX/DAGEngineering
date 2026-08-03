@@ -780,6 +780,91 @@ def test_gsm8k_judge_normalizes_answer():
     assert not judge(type("R", (), {"terminal_output": None})())
 
 
+# --------------------------------------------------------------------------- #
+# φ-nodes — merging competing branches (self-consistency, best-of-N)           #
+# --------------------------------------------------------------------------- #
+def _sc_chat(answers):
+    """Fake `chat`: solvers return a preset sequence (one per sample, in id-sorted execution
+    order); the checker, if reached, always approves. Drives self-consistency deterministically
+    without a model — the diversity a real run gets from temperature is pre-canned here."""
+    box = {"i": 0}
+    def chat(messages, schema, name, required):
+        if name == "solution":
+            a = answers[box["i"] % len(answers)]
+            box["i"] += 1
+            return {"content": {"reasoning": "r", "final_answer": str(a)},
+                    "usage": {"input_tokens": 4, "output_tokens": 2, "cost": 0.001}}
+        return {"content": {"verified": True, "confidence": 1.0, "critique": ""},
+                "usage": {"input_tokens": 2, "output_tokens": 1, "cost": 0.001}}
+    return chat
+
+
+def test_phi_argmax_selects_top_score():
+    """Best-of-N: `argmax_score` picks the highest-scored competing candidate and records which
+    branch won (the φ selector, for lineage)."""
+    from dyndag import argmax_score
+    cands = [("a", {"final_answer": "1"}, 0.3), ("b", {"final_answer": "2"}, 0.9),
+             ("c", {"final_answer": "3"}, 0.5)]
+    out, basis = argmax_score(cands)
+    assert out["final_answer"] == "2" and basis["selected_from"] == "b", (out, basis)
+
+
+def test_phi_majority_vote_self_consistency():
+    """Self-consistency: `majority_vote` picks the modal answer across competing samples and
+    records the tally; a lone dissenter is outvoted."""
+    from dyndag import majority_vote
+    cands = [(f"s{i}", {"final_answer": a}, None)
+             for i, a in enumerate(["18", "18", "18", "20", "7"])]
+    out, basis = majority_vote("final_answer")(cands)
+    assert out["final_answer"] == "18", out
+    assert basis["votes"] == {"18": 3, "20": 1, "7": 1} and basis["winner"] == "18", basis
+
+
+def test_phi_merge_replays_identically():
+    """A graph containing a φ-merge replays to an identical projection (the merge is a pure,
+    id-sorted, deterministic fold) — INV-5.2 holds with competing branches + a φ-node."""
+    from dyndag import gsm8k_registry, AnswerGoal
+    store = SQLiteEventStore(":memory:")
+    reg = gsm8k_registry(_sc_chat(["7", "7", "9"]), mode="sc", k=3)
+    r = Scheduler(store, reg, budget=Budget(), goal_predicate=AnswerGoal()).run(
+        {"question": "Compute 3 plus 4.", "problem_id": 0})
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    phi = r.terminal_output.get("phi")
+    assert phi and phi["policy"] == "majority_vote", r.terminal_output
+    assert r.terminal_output["final_answer"] == "7", r.terminal_output
+    assert any(rec.node_type == NodeType.PHI for rec in r.graph.nodes.values()), "no PHI node"
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok, "replay diverged with a φ-merge"
+
+
+def test_phi_fail_closed_on_empty_candidates():
+    """A φ-merge with no candidate inputs is a failed attempt (MalformedResultError), never a
+    silent pass — fail-closed like every other executor (INV-4.2)."""
+    from dyndag import PhiExecutor, majority_vote, Context, MalformedResultError
+    phi = PhiExecutor(majority_vote("final_answer"))
+    ctx = Context(run_id="r", goal={}, self_id="phi.g1", generation=1)
+    try:
+        phi.run({}, {}, ctx)
+        assert False, "empty φ-merge should fail closed"
+    except MalformedResultError:
+        pass
+
+
+def test_gsm8k_self_consistency_beats_singlepass():
+    """The third eval arm on GSM8K: one greedy solver is wrong, but the MAJORITY of K sampled
+    solvers is right — single-pass fails, self-consistency (φ majority-vote) succeeds."""
+    from dyndag import gsm8k_registry, EvalTask, run_eval, AnswerGoal
+    from dyndag.tasks_gsm8k import _make_judge
+    task = EvalTask("q", {"question": "Compute 3 plus 4.", "problem_id": 0},
+                    judge=_make_judge("7"), goal_predicate=AnswerGoal())
+    results = run_eval([task], {
+        "single": lambda: gsm8k_registry(_sc_chat(["20"]), mode="single"),
+        "sc":     lambda: gsm8k_registry(_sc_chat(["20", "7", "7", "7", "7"]), mode="sc", k=5),
+    })
+    assert results["single"]["q"].success is False, "single-pass should take the wrong answer"
+    assert results["sc"]["q"].success is True, "self-consistency should outvote the wrong sample"
+
+
 def main():
     tests = [v for k, v in globals().items() if k.startswith("test_")]
     for t in tests:

@@ -216,9 +216,12 @@ Module: `steering.ConstraintFilter`.
 `beam_prune` keeps the top-`width` frontier candidates by `value_function`
 (critic scores dominate), making wide speculative expansion affordable.
 Aggregation (`SynthesizerExecutor`, in-degree > 1) merges convergent branches to
-a single terminal output.
+a single terminal output. When the branches are *competing* definitions of the same
+result (K sampled solutions, or two refinement lineages) rather than complementary
+parts, a **φ-node** (`phi.PhiExecutor`) is the merge with an explicit selection rule —
+argmax-score, majority-vote, or union — recording which branch won (§6, §9).
 
-Modules: `steering.beam_prune`, `executors.SynthesizerExecutor`.
+Modules: `steering.beam_prune`, `executors.SynthesizerExecutor`, `phi.PhiExecutor`.
 
 ---
 
@@ -420,6 +423,7 @@ Module: `governor.CostGovernor`, `scheduler.run`.
 | real ORCHESTRATOR: bounded plan + guaranteed coverage (§9) | `test_openrouter_orchestrator_plans_and_guarantees_coverage` |
 | cost-routing eval measures success vs cost (§9) | `test_eval_harness_ranks_policies_by_cost`; `test_eval_runs_mock_registry_offline` |
 | GSM8K eval: SSA iteration lifts accuracy; metrics + replay (§9) | `test_gsm8k_ssa_helps_vs_singlepass`; `test_gsm8k_eval_metrics_surface`; `test_gsm8k_judge_normalizes_answer` |
+| φ-merge selects/combines competing branches; pure ⇒ replay-stable; fail-closed (§6, §9) | `test_phi_argmax_selects_top_score`; `test_phi_majority_vote_self_consistency`; `test_phi_merge_replays_identically`; `test_phi_fail_closed_on_empty_candidates`; `test_gsm8k_self_consistency_beats_singlepass` |
 | SSA write-once | `test_single_assignment_write_once` |
 
 Run `python demo.py` and `python test_invariants.py`; both assert these.
@@ -472,14 +476,25 @@ What changes, and nothing else does:
   validate/repair land on the fail-closed guard (INV-4.2). GOAL/SYNTHESIZER stay mock.
   Run `python demo_ollama.py` (local) or `python eval_cost_routing.py` (cost routing).
 * **Standard-benchmark eval (GSM8K)** — the substrate pointed at grade-school math
-  (`tasks_gsm8k`): SOLVER/CHECKER/ANSWER roles over the same `chat`, run under two
-  configurations — **single-pass** (one shot) and **SSA-generational** (a CHECKER drives
-  refinement, each retry a new generation). The harness reports the paper's five numbers —
-  accuracy (does SSA iteration help?), **$ per correct answer** (the cost/quality frontier),
-  mean generations (the SSA metric), wall-clock under concurrency, and replay-equivalence
-  holding live during the eval. Correctness is graded by an exact-match **judge** on the
-  gold number; the goal predicate (`AnswerGoal`) only certifies an answer was produced, so
-  the DAG never sees the gold label. Run `python eval_gsm8k.py --data test.jsonl`.
+  (`tasks_gsm8k`): SOLVER/CHECKER/ANSWER roles over the same `chat`, run under three
+  configurations — **single-pass** (one shot), **SSA-generational** (a CHECKER drives
+  refinement, each retry a new generation), and **self-consistency** (K sampled solvers
+  merged by a **φ-node** majority-vote — `phi.py`). The harness reports the paper's five
+  numbers — accuracy (does SSA iteration help?), **$ per correct answer** (the cost/quality
+  frontier), mean generations (the SSA metric), wall-clock under concurrency, and replay-
+  equivalence holding live during the eval — the last even under temperature-sampled
+  self-consistency, because every sample is a recorded activity. Correctness is graded by an
+  exact-match **judge** on the gold number; the goal predicate (`AnswerGoal`) only certifies
+  an answer was produced, so the DAG never sees the gold label. Run
+  `python eval_gsm8k.py --data test.jsonl --configs single,ssa,sc`.
+* **φ-nodes (`phi.py`) — merging competing branches.** The SYNTHESIZER aggregates one
+  approved branch (arity-1); a φ-node is the arity-N generalization with an explicit selection
+  rule — the SSA φ-function made concrete. Competing branches (K solver samples, or two
+  refinement lineages) fan into a `PhiExecutor` that applies a merge policy — **argmax-score**
+  (best-of-N), **majority-vote** (self-consistency), or **union** (combine) — and records the
+  selector (which branch won, and the tally) on its output for lineage. The merge is a pure,
+  id-sorted, deterministic fold, so the graph stays replay-identical (INV-5.2); empty input is
+  fail-closed (INV-4.2).
 * **Idempotency keys** on external side-effecting Activities so replay/retry does
   not double-execute the world. *Done at the seam:* `Context.record(key, fn)` +
   `ACTIVITY_RECORDED` make each recorded step exactly-once across retries (§5.2).
@@ -507,7 +522,8 @@ What changes, and nothing else does:
 | `roles.py` | §3.1, §4.1, §5.2–5.3, §9 (**single source** of the model-backed ENGINEER/REVIEWER/ORCHESTRATOR logic + prompts + the shared validate→repair loop, over an abstract `chat`; real retrieval SCOUT) |
 | `executors_ollama.py` | §3.1, §5.2 (native-Ollama `chat` — `format=` structured transport + registry; injectable call, offline-testable) |
 | `executors_openrouter.py` | §4.1, §5.2–5.3, §9 (OpenAI-compatible `chat` — raw-urllib transport + refusal/cost extract + registry; `max_retries=0` by construction; injectable transport) |
-| `tasks_gsm8k.py` | §9 (GSM8K as a DAG task: SOLVER/CHECKER/ANSWER roles + orchestrator over `chat`; single-pass & SSA registries; JSONL loader + exact-match judge) |
+| `phi.py` | §6, §9 (φ-nodes: merge COMPETING branches — argmax-score / majority-vote / union policies; `PhiExecutor` records the selector; pure ⇒ replay-stable, fail-closed) |
+| `tasks_gsm8k.py` | §9 (GSM8K as a DAG task: SOLVER/CHECKER/ANSWER roles + orchestrator over `chat`; single-pass / SSA / self-consistency (φ) registries; JSONL loader + exact-match judge) |
 | `evaluation.py` | §9 (eval harness: policies, run_eval; cost-routing report **and** GSM8K report — accuracy, $/correct, generations, wall-clock, replay) |
 | `steering.py` | §3.2–3.4 (**pluggable** goal predicate — `GoalPredicate` protocol, `CoverageGoal` / `AnswerGoal`; filter, beam, value) |
 | `governor.py` | §7 (bounds, retry budget) |
