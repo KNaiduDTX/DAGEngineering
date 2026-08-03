@@ -1,23 +1,27 @@
 """
 eval_gsm8k.py — GSM8K accuracy vs the cost/quality frontier, measured live.
 
-Runs GSM8K under reasoning-strategy policies on ONE provider, so the comparison isolates the
-STRATEGY (not the model):
+Runs GSM8K under four reasoning-strategy policies on ONE provider, so the comparison isolates
+the STRATEGY (not the model) and ablates the two construction primitives (refine, merge):
 
-  * single-pass  — one solver, no critic
-  * ssa          — solver + checker: the SSA refinement loop (each retry a NEW generation,
-                   solver.g{k+1}, never a cycle)
+  * single-pass  — neither. one solver, no critic
+  * ssa          — refine only. solver + checker; the SSA loop (each retry a NEW generation)
+  * sc           — merge only. K sampled solvers -> a φ majority-vote
+  * combined     — both. K ADAPTIVE lineages -> a verifier-weighted φ over a DYNAMIC JOIN
+                   (each lineage refines to its own critic's satisfaction; F2 runs the critics
+                   greedy while the solvers sample)
 
-The report prints the paper's five numbers: accuracy, $ per correct answer, mean generations
-(does SSA iteration help?), mean wall-clock (latency under concurrency), and replay-
-equivalence holding live during the eval.
+The report prints the paper's five numbers (accuracy, $ per correct answer, mean generations,
+mean wall-clock, replay-equivalence live) PLUS a paired McNemar analysis over the shared task
+set — the right test when every policy runs the same problems.
 
-Provider is auto-detected (Ollama at :11434, else OPENROUTER_API_KEY); the run skips if
-neither is available. Data is a GSM8K test JSONL; with no --data it falls back to the tiny
-AUTHORED sample set (a plumbing smoke test, not a real benchmark number).
+Provider is auto-detected (Ollama at :11434, else OPENROUTER_API_KEY -> --cloud-model, default
+DeepSeek V4 Flash); the run skips if neither is available. Data is a GSM8K test JSONL; with no
+--data it falls back to the tiny AUTHORED sample set (a plumbing smoke, not a benchmark number).
 
     curl -sL https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl -o test.jsonl
-    OPENROUTER_API_KEY=... python eval_gsm8k.py --data test.jsonl --n 250 --configs single,ssa
+    OPENROUTER_API_KEY=... python eval_gsm8k.py --data test.jsonl --n 300 \
+        --configs single,ssa,sc,combined --k 5 --dump results.json
 """
 
 from __future__ import annotations
@@ -69,11 +73,10 @@ def main() -> None:
     ap.add_argument("--configs", default="single,ssa,sc,combined",
                     help="comma list of: single, ssa, sc, combined")
     ap.add_argument("--k", type=int, default=5, help="samples/lineages for sc and combined")
-    ap.add_argument("--r", type=int, default=1, help="refinement rounds per lineage (combined)")
     ap.add_argument("--sc-temperature", type=float, default=0.8,
                     help="sampling temperature for sc/combined solvers (diversity)")
     ap.add_argument("--local-model", default="llama3.2")
-    ap.add_argument("--cloud-model", default="openai/gpt-4o-mini")
+    ap.add_argument("--cloud-model", default="deepseek/deepseek-v4-flash")
     ap.add_argument("--max-workers", type=int, default=1, help="WIP cap per task (concurrency)")
     ap.add_argument("--dump", default=None, help="write per-problem results JSON to this path")
     args = ap.parse_args()
@@ -95,13 +98,16 @@ def main() -> None:
     source = args.data or "authored-sample"
 
     def _registry_for(c):
-        if c in _SAMPLED:                                 # sampled solvers so the K lineages differ
-            return gsm8k_registry(make_chat(args.sc_temperature), mode=c, k=args.k, r=args.r)
-        return gsm8k_registry(make_chat(None), mode=c)    # greedy for single / ssa
+        if c == "combined":                              # F1/F2/F3: sampled solvers, GREEDY critics
+            return gsm8k_registry(make_chat(args.sc_temperature), mode="combined", k=args.k,
+                                  critic_chat=make_chat(None))
+        if c == "sc":                                    # sampled solvers so the K samples differ
+            return gsm8k_registry(make_chat(args.sc_temperature), mode="sc", k=args.k)
+        return gsm8k_registry(make_chat(None), mode=c)   # greedy single / ssa
     policies = {c: (lambda c=c: _registry_for(c)) for c in configs}
 
-    kr = f"  k={args.k} r={args.r}" if any(c in _SAMPLED for c in configs) else ""
-    print(f"provider={provider}  data={source}  tasks={len(tasks)}  configs={configs}{kr}\n")
+    kinfo = f"  k={args.k}" if any(c in _SAMPLED for c in configs) else ""
+    print(f"provider={provider}  data={source}  tasks={len(tasks)}  configs={configs}{kinfo}\n")
     results = run_eval(tasks, policies, max_workers=args.max_workers)
     print(gsm8k_report(results))
     if len(configs) >= 2:

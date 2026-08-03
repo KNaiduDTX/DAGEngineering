@@ -424,7 +424,8 @@ Module: `governor.CostGovernor`, `scheduler.run`.
 | cost-routing eval measures success vs cost (§9) | `test_eval_harness_ranks_policies_by_cost`; `test_eval_runs_mock_registry_offline` |
 | GSM8K eval: SSA iteration lifts accuracy; metrics + replay (§9) | `test_gsm8k_ssa_helps_vs_singlepass`; `test_gsm8k_eval_metrics_surface`; `test_gsm8k_judge_normalizes_answer` |
 | φ-merge selects/combines competing branches; pure ⇒ replay-stable; fail-closed (§6, §9) | `test_phi_argmax_selects_top_score`; `test_phi_majority_vote_self_consistency`; `test_phi_merge_replays_identically`; `test_phi_fail_closed_on_empty_candidates`; `test_gsm8k_self_consistency_beats_singlepass` |
-| combined φ-of-SSA arm (refine each line, then merge); paired McNemar analysis (§9) | `test_gsm8k_combined_refines_then_merges`; `test_gsm8k_combined_beats_sc_when_refinement_helps`; `test_mcnemar_paired_and_domination` |
+| dynamic JOIN materializes over adaptive-depth lineages; acyclic + replay-stable (§6, §9) | `test_dynamic_join_materializes_over_adaptive_depth` |
+| combined φ-of-SSA arm (adaptive refine + verifier-weighted merge); paired McNemar (§9) | `test_gsm8k_combined_refines_then_merges`; `test_gsm8k_combined_beats_sc_when_refinement_helps`; `test_mcnemar_paired_and_domination` |
 | SSA write-once | `test_single_assignment_write_once` |
 
 Run `python demo.py` and `python test_invariants.py`; both assert these.
@@ -481,27 +482,37 @@ What changes, and nothing else does:
   configurations that ablate the two construction primitives —
   **single-pass** (neither), **SSA-generational** (refinement only — a CHECKER drives it, each
   retry a new generation), **self-consistency** (merge only — K sampled solvers → a **φ-node**
-  majority-vote), and **combined / φ-of-SSA** (both — K lineages each refined then φ-merged),
-  the arm that tests the *compositional* claim. The harness reports the paper's five numbers —
-  accuracy, **$ per correct answer** (the cost/quality frontier), mean generations, wall-clock
-  under concurrency, and replay-equivalence holding live during the eval (even under
-  temperature-sampled self-consistency, because every sample is a recorded activity) — plus a
-  **paired McNemar** analysis over the *shared* task set (the right test when every policy runs
-  the same problems, and the only way to see strict domination or that a small marginal gap is
-  within noise). Correctness is graded by an exact-match **judge** on the gold number; the goal
-  predicate (`AnswerGoal`) only certifies an answer was produced, so the DAG never sees the gold
-  label. Run `python eval_gsm8k.py --data test.jsonl --configs single,ssa,sc,combined --dump p.json`.
-  *Note (a real limitation surfaced by the combined arm):* the substrate builds statically —
-  edges are stamped at node creation under generation monotonicity — so a φ-node cannot grow
-  its fan-in over lineages whose depth a critic decides at runtime. The combined arm therefore
-  uses **fixed-depth** refinement per lineage (pre-unrolled), not the adaptive SSA loop; adaptive
-  dynamic fan-in (a runtime join/barrier) is future work.
+  majority-vote), and **combined / φ-of-SSA** (both — K **adaptive** lineages, each refined to
+  its own critic's satisfaction, then merged by a **verifier-weighted** φ over a **dynamic
+  join**), the arm that tests the *compositional* claim. The harness reports the paper's five
+  numbers — accuracy, **$ per correct answer** (the cost/quality frontier), mean generations,
+  wall-clock under concurrency, and replay-equivalence holding live during the eval (even under
+  temperature-sampled self-consistency and the adaptive join, because every sample is a recorded
+  activity) — plus a **paired McNemar** analysis over the *shared* task set (the right test when
+  every policy runs the same problems, and the only way to see strict domination or that a small
+  marginal gap is within noise). Correctness is graded by an exact-match **judge** on the gold
+  number; the goal predicate (`AnswerGoal`) only certifies an answer was produced, so the DAG
+  never sees the gold label. Run
+  `python eval_gsm8k.py --data test.jsonl --configs single,ssa,sc,combined --dump p.json`.
+* **On-the-fly dynamic fan-in — the JOIN primitive (`JoinSpec`, `graph.joins`, `scheduler.
+  _materialize_joins`).** Static fan-out (K known solvers) can be φ-merged directly, but ADAPTIVE
+  fan-out cannot: when K lineages refine to *data-dependent* depth, their terminal ids are
+  unknown when the merge is created, and generation-monotonic edges forbid wiring the merge to
+  them after the fact. The join resolves this as **deferred static fan-in**: an expander
+  *declares* a quorum-K join (`JOIN_DECLARED`); each lineage, on approval, *contributes* its
+  certified result (`JOIN_CONTRIBUTED`); once K contributions arrive the scheduler
+  **materializes** the join as a PHI node over the now-concrete contributors, at generation
+  max(contributor)+1 — so every edge still climbs and **acyclicity/replay hold with no
+  monotonicity relaxation**. This is the "graph builds itself on the fly" the design claims,
+  made real for adaptive merging. (Relaxing monotonicity into a general incremental-topo engine —
+  Pearce–Kelly — remains the more general future option.)
 * **φ-nodes (`phi.py`) — merging competing branches.** The SYNTHESIZER aggregates one
   approved branch (arity-1); a φ-node is the arity-N generalization with an explicit selection
   rule — the SSA φ-function made concrete. Competing branches (K solver samples, or two
   refinement lineages) fan into a `PhiExecutor` that applies a merge policy — **argmax-score**
-  (best-of-N), **majority-vote** (self-consistency), or **union** (combine) — and records the
-  selector (which branch won, and the tally) on its output for lineage. The merge is a pure,
+  (best-of-N), **majority-vote** (self-consistency), **confidence-weighted vote** (verifier
+  -weighted — consensus scaled by the critics' confidence), or **union** (combine) — and records
+  the selector (which branch won, and the tally) on its output for lineage. The merge is a pure,
   id-sorted, deterministic fold, so the graph stays replay-identical (INV-5.2); empty input is
   fail-closed (INV-4.2).
 * **Idempotency keys** on external side-effecting Activities so replay/retry does
@@ -523,19 +534,19 @@ What changes, and nothing else does:
 |---|---|
 | `core.py` | §1 (ids, enums, provenance, events) |
 | `store.py` | §1.3, §1.5, §5.1 (log + provenance guard) |
-| `graph.py` | §1.1, §1.4, §6, lineage (§5, §8) |
-| `nodes.py` | §2.1, §2.3 (patch, placeholders) |
+| `graph.py` | §1.1, §1.4, §6, lineage (§5, §8); dynamic-join fold (`joins`, `ready_joins`) |
+| `nodes.py` | §2.1, §2.3 (patch, placeholders, `JoinSpec` — declared dynamic fan-in) |
 | `activities.py` | §5.2 (recorded activities — replay/idempotency at the executor seam) |
 | `schemas.py` | §2.1, §9 (shared structured-output contracts: DRAFT/REVIEW/PLAN + SOLUTION/VERIFY — flat, non-recursive) |
 | `executors.py` | §3.1, §4.1–4.2, §5.3, §9 (mock roles, critic loop, routing, retryable/terminal taxonomy) |
 | `roles.py` | §3.1, §4.1, §5.2–5.3, §9 (**single source** of the model-backed ENGINEER/REVIEWER/ORCHESTRATOR logic + prompts + the shared validate→repair loop, over an abstract `chat`; real retrieval SCOUT) |
 | `executors_ollama.py` | §3.1, §5.2 (native-Ollama `chat` — `format=` structured transport + registry; injectable call, offline-testable) |
 | `executors_openrouter.py` | §4.1, §5.2–5.3, §9 (OpenAI-compatible `chat` — raw-urllib transport + refusal/cost extract + registry; `max_retries=0` by construction; injectable transport) |
-| `phi.py` | §6, §9 (φ-nodes: merge COMPETING branches — argmax-score / majority-vote / union policies; `PhiExecutor` records the selector; pure ⇒ replay-stable, fail-closed) |
-| `tasks_gsm8k.py` | §9 (GSM8K as a DAG task: SOLVER / CHECKER / pure-CRITIC / ANSWER roles + orchestrator over `chat`; single-pass / SSA / self-consistency / **combined (φ-of-SSA)** registries; JSONL loader + exact-match judge) |
+| `phi.py` | §6, §9 (φ-nodes: merge COMPETING branches — argmax-score / majority-vote / confidence-weighted / union; `PhiExecutor` records the selector; pure ⇒ replay-stable, fail-closed) |
+| `tasks_gsm8k.py` | §9 (GSM8K as a DAG task: SOLVER / CHECKER / ANSWER roles + orchestrator over `chat`; single-pass / SSA / self-consistency / **combined (adaptive φ-of-SSA via a dynamic join)** registries; JSONL loader + exact-match judge) |
 | `evaluation.py` | §9 (eval harness: policies, run_eval; cost-routing report, GSM8K report — accuracy, $/correct, generations, wall-clock, replay — and **paired McNemar** analysis over the shared task set) |
 | `steering.py` | §3.2–3.4 (**pluggable** goal predicate — `GoalPredicate` protocol, `CoverageGoal` / `AnswerGoal`; filter, beam, value) |
 | `governor.py` | §7 (bounds, retry budget) |
-| `scheduler.py` | §2.2, §5.4 (the loop; goal predicate is injectable — the one task-specific seam) |
+| `scheduler.py` | §2.2, §5.4 (the loop; injectable goal predicate; `_materialize_joins` — deferred static fan-in for dynamic joins) |
 | `views.py` | §4.3, §5.2, §8 (blackboard, replay, lineage, cost report) |
 | `demo.py`, `demo_ollama.py`, `eval_cost_routing.py`, `eval_gsm8k.py`, `test_invariants.py` | §8, §9 (executable proofs + live demos) |

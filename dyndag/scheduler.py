@@ -35,7 +35,7 @@ from .executors import (Context, ExecutionResult, Executor, MalformedResultError
                         ModelRouter, TerminalExecutionError)
 from .governor import Budget, CostGovernor
 from .graph import GraphProjection
-from .nodes import NodeSpec, SubgraphPatch, resolve_placeholders
+from .nodes import JoinSpec, NodeSpec, SubgraphPatch, resolve_placeholders
 from .steering import ConstraintFilter, CoverageGoal, GoalPredicate
 from .store import EventStore
 
@@ -176,10 +176,40 @@ class Scheduler:
             if not progressed:
                 raise ValueError(f"unresolvable patch from {expander_id}: "
                                  f"{[s.key for s in pending]}")
+        for jspec in patch.declared_joins:                 # dynamic fan-in points (Layer 2)
+            self._emit(Event(run_id=run_id, type=EventType.JOIN_DECLARED, node_id=expander_id,
+                             payload={"key": jspec.key, "quorum": jspec.quorum,
+                                      "policy": jspec.policy}))
+        for join_key, contributor in patch.contributions:  # one lineage binds its result
+            self._emit(Event(run_id=run_id, type=EventType.JOIN_CONTRIBUTED, node_id=contributor,
+                             payload={"key": join_key, "contributor": contributor}))
         self._emit(Event(run_id=run_id, type=EventType.SUBGRAPH_EMITTED,
                          node_id=expander_id,
                          payload={"added_nodes": created}))
         return created
+
+    def _materialize_joins(self, run_id: str) -> None:
+        """Create a PHI node for each declared join whose quorum of contributions has arrived —
+        DEFERRED static fan-in. The join sits one generation above its highest contributor, so
+        every edge climbs (acyclic, no monotonicity relaxation). The NODE_CREATED carries
+        `join_key` so the fold links node<->join. This is the on-the-fly merge over adaptively
+        -deep lineages: the fan-in members are unknown when the join is declared, concrete when
+        it fires. Serial/single-writer, like every other creation."""
+        for key in self.graph.ready_joins():
+            j = self.graph.joins[key]
+            contributors = tuple(j["contributors"])
+            gen = self.graph.next_generation_for(contributors)
+            node_id = stable_node_id(key, gen, contributors)
+            if node_id in self.graph.nodes:                 # defensive: already materialized
+                continue
+            prov = self._provenance(run_id, gen, contributors, expander_id=None)
+            self._emit(Event(
+                run_id=run_id, type=EventType.NODE_CREATED, node_id=node_id,
+                payload={"node_type": NodeType.PHI.value, "input_ids": list(contributors),
+                         "params": {"join_key": key, "join_policy": j["policy"]},
+                         "provenance": prov.as_dict(), "join_key": key}))
+            for c in contributors:
+                self._create_edge(run_id, c, node_id, gen, expander_id=None)
 
     # --------------------------------------------------------------------- #
     # one node, in three phases: admit -> execute -> commit                   #
@@ -364,6 +394,16 @@ class Scheduler:
         for edge in patch.added_edges:
             if not (isinstance(edge, (tuple, list)) and len(edge) == 2):
                 raise MalformedResultError(f"malformed edge {edge!r}")
+        for jspec in patch.declared_joins:
+            if not isinstance(jspec, JoinSpec):
+                raise MalformedResultError(f"declared join is {type(jspec).__name__}, not JoinSpec")
+            if not isinstance(jspec.quorum, int) or jspec.quorum < 1:
+                raise MalformedResultError(f"join {jspec.key!r} has invalid quorum {jspec.quorum!r}")
+            if NodeType.PHI not in self.registry:
+                raise MalformedResultError("a declared join needs a PHI executor in the registry")
+        for contrib in patch.contributions:
+            if not (isinstance(contrib, (tuple, list)) and len(contrib) == 2):
+                raise MalformedResultError(f"malformed contribution {contrib!r}")
 
     def _reopen(self, run_id: str, node_id: str) -> None:
         """Return a FAILED node to the frontier for another attempt — as a RECORDED
@@ -407,6 +447,8 @@ class Scheduler:
             reason = self.governor.check(self.graph, generation)
             if reason is not None:
                 break
+
+            self._materialize_joins(run_id)   # quorum-met joins become PHI nodes (Layer 2)
 
             frontier = self.graph.ready_set()
             if not frontier:
@@ -504,6 +546,7 @@ class Scheduler:
             if over is not None:
                 st["reason"], st["stop"] = over, True
                 return
+            self._materialize_joins(run_id)   # quorum-met joins become PHI nodes
             for node_id in self.graph.ready_set():
                 if st["in_flight"] >= max_inflight:      # backpressure: pace admission to commit
                     break

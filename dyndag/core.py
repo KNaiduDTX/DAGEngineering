@@ -131,6 +131,8 @@ class EventType(str, Enum):
     ACTIVITY_RECORDED = "activity_recorded"  # a nondeterministic sub-step's result, recorded for replay/idempotency
     SUBGRAPH_EMITTED = "subgraph_emitted"  # lineage marker: which expander produced which patch
     NODE_PRUNED = "node_pruned"            # Layer 3 constraint filter dropped a proposed node
+    JOIN_DECLARED = "join_declared"        # a dynamic fan-in point: a quorum-K merge to be materialized later
+    JOIN_CONTRIBUTED = "join_contributed"  # one lineage bound its (adaptively-produced) result to a join
     GOAL_SATISFIED = "goal_satisfied"
     RUN_TERMINATED = "run_terminated"
 
