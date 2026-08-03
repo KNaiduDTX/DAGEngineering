@@ -58,8 +58,8 @@ graph** (durability), cost splits across **local vs cloud** tiers, and there are
 core.py                 ids, enums, Provenance (provenance-at-write), Event    L1 L5
 store.py                append-only log + provenance guard (Postgres analog)   L5
 graph.py                fold-of-log projection, ready-set, acyclicity,         L1 L6
-                        lineage, activity cache
-nodes.py                NodeSpec, SubgraphPatch, placeholder resolution        L2
+                        lineage, activity cache, dynamic-join fold
+nodes.py                NodeSpec, SubgraphPatch, JoinSpec, placeholders        L2
 activities.py           recorded activities — exactly-once model calls/replay  L5
 schemas.py              structured-output contracts (DRAFT/REVIEW/PLAN +       L2
                         SOLUTION/VERIFY)
@@ -70,13 +70,13 @@ roles.py                model-backed ENGINEER/REVIEWER/ORCHESTRATOR over an     
 executors_ollama.py     native-Ollama chat: format= transport + registry       L5
 executors_openrouter.py OpenAI-compatible chat: urllib transport, refusal+cost L4 L5
 phi.py                  φ-merge of competing branches: argmax / majority /     L4 L6
-                        union policies; PhiExecutor records the selector
-tasks_gsm8k.py          GSM8K task: solver/critic/answer roles; single/ssa/    L3
-                        sc/combined registries; JSONL loader + exact-match judge
+                        confidence-weighted / union; records the selector
+tasks_gsm8k.py          GSM8K task: solver/checker/answer roles; single/ssa/   L3
+                        sc/combined (adaptive φ-of-SSA via dynamic join)
 steering.py             pluggable goal predicate, constraint filter, beam      L3
 governor.py             caps + GLOBAL retry budget                             L7
 scheduler.py            the loop: admit→execute→commit; batch / async /        L5
-                        distributed-workers execution + backpressure
+                        distributed workers; materializes dynamic joins
 views.py                blackboard, replay verify, lineage + cost report       L4 L5
 evaluation.py           eval harness: cost-routing + GSM8K reports             L5
 ```
@@ -124,10 +124,12 @@ primitives** — refinement (SSA) and merge (φ):
 * **self-consistency** — *merge only*. K solvers sample competing reasoning paths in parallel;
   a **φ-node** (`phi.py`) majority-votes their answers into one, recording the tally as the
   merge's provenance.
-* **combined (φ-of-SSA)** — *both*. K competing lineages, each refined (solver → critic →
-  refined solver), then φ-merged — the arm that tests the **compositional** claim (refine each
-  line *and* take consensus). (Refinement here is fixed-depth: the substrate builds statically,
-  so a φ can't grow its fan-in over adaptively-deep lineages — a real limitation, see `SPEC.md`.)
+* **combined (φ-of-SSA)** — *both*. K **adaptive** lineages, each refined to its own critic's
+  satisfaction (like SSA), then merged by a **verifier-weighted** φ (consensus scaled by the
+  critics' confidence). The lineages have *data-dependent depth*, so they fan into a **dynamic
+  join** (`JoinSpec`): the scheduler materializes the φ over the K certified answers once quorum
+  arrives — deferred static fan-in, so acyclicity and replay hold with no monotonicity
+  relaxation. This is the on-the-fly self-construction the compositional claim actually needs.
 
 `eval_gsm8k.py` reports the five numbers the paper is built around — **accuracy**, **\$ per
 correct answer** (the cost/quality frontier), mean **generations**, mean **wall-clock** (latency

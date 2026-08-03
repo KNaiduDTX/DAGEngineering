@@ -34,8 +34,8 @@ from typing import Optional
 
 from .core import NodeType, Signal
 from .executors import Executor, ExecutionResult, default_registry
-from .nodes import NodeSpec, SubgraphPatch
-from .phi import PhiExecutor, majority_vote
+from .nodes import JoinSpec, NodeSpec, SubgraphPatch
+from .phi import PhiExecutor, confidence_weighted_vote, majority_vote
 from .roles import ChatJson, _LlmRole
 from .schemas import SOLUTION_SCHEMA, VERIFY_SCHEMA
 from .steering import AnswerGoal
@@ -85,10 +85,14 @@ class SolverRole(_LlmRole):
 
 class CheckerRole(_LlmRole):
     """Verify the solver's reasoning (bound to REVIEWER — critique). It does NOT see the gold
-    answer; it judges self-consistency and reports confidence. Mirrors ReviewerRole's steering:
-    verified-and-confident (or the revision cap reached) => emit the terminal ANSWER node
-    (Signal.DONE); else emit a refined solver (SSA g+1) fed the critique + a fresh checker
-    (Signal.NEEDS_REFINEMENT). Bounded convergence via the revision cap and the governor."""
+    answer; it judges self-consistency and reports confidence. Adaptive steering with two APPROVE
+    exits (verified-and-confident, or the revision cap reached):
+      * standalone SSA (no `join` in params) => emit the terminal ANSWER node (Signal.DONE);
+      * a join lineage (combined arm)        => CONTRIBUTE this lineage's certified answer to the
+        dynamic join (Signal.CONTINUE), carrying its confidence as `score` so the φ can verifier
+        -weight it.
+    On REJECT it emits a refined solver (SSA g+1) fed the critique + a fresh checker, keyed
+    per-lineage (`lin`) so K lineages refine independently. Bounded by the revision cap + governor."""
 
     def __init__(self, chat: ChatJson, target_confidence: float = 0.9, max_revision: int = 3):
         super().__init__(chat)
@@ -101,6 +105,8 @@ class CheckerRole(_LlmRole):
         sol_id = next(k for k, v in inputs.items() if v is solution)
         question = solution["question"]
         revision = solution.get("revision", 0)
+        join = params.get("join")                     # set => this lineage feeds a dynamic join
+        lin = params.get("lin")                       # lineage index => per-lineage node keys
         messages = [
             {"role": "system", "content": (
                 "You are a strict math checker. Decide whether the solution's reasoning is "
@@ -120,8 +126,20 @@ class CheckerRole(_LlmRole):
         critique = str(data.get("critique", ""))
 
         # Approve when the critic is satisfied, or when the revision cap is hit (take the
-        # best-so-far answer so the run terminates with a solution rather than starving).
+        # best-so-far answer so the lineage terminates rather than starving).
         if (verified and confidence >= self.target_confidence) or revision >= self.max_revision:
+            if join is not None:
+                # Certify this lineage's answer and CONTRIBUTE it to the join. This checker node
+                # is the contributor: it carries the answer + its confidence as `score`, which the
+                # verifier-weighted φ uses to weight the merge.
+                certified = {"kind": "solution", "question": question,
+                             "final_answer": solution.get("final_answer", ""),
+                             "reasoning": solution.get("reasoning", ""),
+                             "confidence": round(confidence, 3), "score": round(confidence, 3),
+                             "revision": revision}
+                return ExecutionResult(output=certified, signal=Signal.CONTINUE,
+                                       score=confidence, usage=usage,
+                                       patch=SubgraphPatch(contributions=[(join, ctx.self_id)]))
             answer = NodeSpec(key="answer", node_type=NodeType.SYNTHESIZER,
                               input_keys=(sol_id, ctx.self_id), params={})
             return ExecutionResult(
@@ -130,50 +148,19 @@ class CheckerRole(_LlmRole):
                 signal=Signal.DONE, score=confidence, usage=usage,
                 patch=SubgraphPatch(added_nodes=[answer]))
 
-        refined = NodeSpec(key="solver", node_type=NodeType.ENGINEER,
+        skey = "solver" if lin is None else f"solver_{lin}"
+        ckey = "checker" if lin is None else f"checker_{lin}"
+        refined = NodeSpec(key=skey, node_type=NodeType.ENGINEER,
                            input_keys=(sol_id, ctx.self_id),
                            params={"question": question, "revision": revision + 1,
-                                   "critique": critique})
-        re_check = NodeSpec(key="checker", node_type=NodeType.REVIEWER,
-                            input_keys=("solver",), params={})
+                                   "critique": critique, "join": join, "lin": lin})
+        re_check = NodeSpec(key=ckey, node_type=NodeType.REVIEWER,
+                            input_keys=(skey,), params={"join": join, "lin": lin})
         return ExecutionResult(
             output={"verdict": "reject", "verified": verified,
                     "confidence": round(confidence, 3), "critique": critique},
             signal=Signal.NEEDS_REFINEMENT, score=confidence, usage=usage,
             patch=SubgraphPatch(added_nodes=[refined, re_check]))
-
-
-class CritiqueRole(_LlmRole):
-    """A PURE critic (bound to REVIEWER in the combined φ-of-SSA arm): scores a solution's
-    reasoning and returns a one-line critique, emitting NO patch — the refinement structure is
-    pre-unrolled by the orchestrator (the substrate can't grow a φ's fan-in adaptively, so the
-    depth is fixed). Contrast `CheckerRole`, which DRIVES an adaptive loop by emitting nodes.
-    Its output `kind` is "critique" so the next solver reads it as feedback, not as a prior
-    solution."""
-
-    def run(self, inputs, params, ctx) -> ExecutionResult:
-        solution = next(v for v in inputs.values()
-                        if isinstance(v, dict) and v.get("kind") == "solution")
-        sol_id = next(k for k, v in inputs.items() if v is solution)
-        messages = [
-            {"role": "system", "content": (
-                "You are a strict math checker. Decide whether the solution's reasoning is "
-                "correct and internally consistent for the problem, and give a one-line "
-                "critique naming any error to fix. Return verified (bool), confidence 0.0-1.0, "
-                "and the critique. Respond with JSON only.")},
-            {"role": "user", "content": json.dumps({
-                "problem": solution["question"], "reasoning": solution.get("reasoning", ""),
-                "final_answer": solution.get("final_answer", "")})},
-        ]
-        recorded = ctx.record(f"critique_{sol_id}",
-                              lambda: self.chat(messages, VERIFY_SCHEMA, "verify",
-                                                ("verified", "confidence")))
-        data, usage = recorded["content"], recorded.get("usage")
-        confidence = max(0.0, min(1.0, float(data.get("confidence", 0.0))))
-        return ExecutionResult(output={
-            "kind": "critique", "verified": bool(data.get("verified")),
-            "confidence": round(confidence, 3), "critique": str(data.get("critique", "")),
-        }, signal=Signal.CONTINUE, score=confidence, usage=usage)
 
 
 class AnswerExecutor(Executor):
@@ -207,13 +194,12 @@ class GsmOrchestrator(Executor):
     stamped at creation under generation monotonicity).
     """
 
-    def __init__(self, mode: str = "ssa", k: int = 5, r: int = 1):
+    def __init__(self, mode: str = "ssa", k: int = 5):
         if mode not in ("single", "ssa", "sc", "combined"):
             raise ValueError(
                 f"unknown GSM8K mode {mode!r} (expected 'single', 'ssa', 'sc' or 'combined')")
         self.mode = mode
         self.k = max(1, int(k))
-        self.r = max(1, int(r))           # refinement rounds per lineage (combined)
 
     def run(self, inputs, params, ctx) -> ExecutionResult:
         goal = ctx.goal if isinstance(ctx.goal, dict) else {}
@@ -233,30 +219,26 @@ class GsmOrchestrator(Executor):
                 signal=Signal.CONTINUE, patch=SubgraphPatch(added_nodes=[*solvers, phi]))
 
         if self.mode == "combined":
-            # K competing lineages, each refined `r` rounds (solver -> critic -> refined solver),
-            # then φ majority-vote over the K refined solutions. Fully unrolled: fan-in is over
-            # fixed keys (solver_i_r), the only shape the substrate's static construction allows.
+            # φ-of-SSA (Design 1, on-the-fly): K ADAPTIVE lineages — each solver -> checker ->
+            # refine… until its OWN critic approves (adaptive depth, like ssa) — all contributing
+            # to one DYNAMIC JOIN. The join materializes into a verifier-weighted φ once all K
+            # certified answers arrive; the lineage terminals are unknown here (data-dependent
+            # depth), which is exactly what the declared join handles.
             nodes: list = []
-            refined: list = []
             for i in range(self.k):
-                prev = NodeSpec(key=f"solver_{i}_0", node_type=NodeType.ENGINEER,
-                                input_keys=(ctx.self_id,),
-                                params={"question": question, "revision": 0, "sample": i})
-                nodes.append(prev)
-                for j in range(self.r):
-                    critic = NodeSpec(key=f"critic_{i}_{j}", node_type=NodeType.REVIEWER,
-                                      input_keys=(prev.key,), params={})
-                    nxt = NodeSpec(key=f"solver_{i}_{j + 1}", node_type=NodeType.ENGINEER,
-                                   input_keys=(prev.key, critic.key),
-                                   params={"question": question, "revision": j + 1, "sample": i})
-                    nodes += [critic, nxt]
-                    prev = nxt
-                refined.append(prev.key)
-            phi = NodeSpec(key="phi", node_type=NodeType.PHI, input_keys=tuple(refined), params={})
-            nodes.append(phi)
+                solver = NodeSpec(key=f"solver_{i}", node_type=NodeType.ENGINEER,
+                                  input_keys=(ctx.self_id,),
+                                  params={"question": question, "revision": 0, "sample": i,
+                                          "join": "J", "lin": i})
+                checker = NodeSpec(key=f"checker_{i}", node_type=NodeType.REVIEWER,
+                                   input_keys=(f"solver_{i}",), params={"join": "J", "lin": i})
+                nodes += [solver, checker]
             return ExecutionResult(
-                output={"mode": "combined", "plan": [n.key for n in nodes]},
-                signal=Signal.CONTINUE, patch=SubgraphPatch(added_nodes=nodes))
+                output={"mode": "combined", "plan": [n.key for n in nodes] + ["J"]},
+                signal=Signal.CONTINUE,
+                patch=SubgraphPatch(added_nodes=nodes,
+                                    declared_joins=[JoinSpec("J", quorum=self.k,
+                                                             policy="confidence_weighted_vote")]))
 
         solver = NodeSpec(key="solver", node_type=NodeType.ENGINEER,
                           input_keys=(ctx.self_id,),
@@ -275,26 +257,27 @@ class GsmOrchestrator(Executor):
 # --------------------------------------------------------------------------- #
 # Registry (policy) factory                                                   #
 # --------------------------------------------------------------------------- #
-def gsm8k_registry(chat: ChatJson, mode: str = "ssa", k: int = 5, r: int = 1,
+def gsm8k_registry(chat: ChatJson, mode: str = "ssa", k: int = 5,
+                   critic_chat: Optional[ChatJson] = None,
                    target_confidence: float = 0.9, max_revision: int = 3) -> dict:
     """A registry (eval policy) for GSM8K over a provider-agnostic `chat`. SOLVER=ENGINEER
     (local tier), CHECKER=REVIEWER (cloud tier) — so the cost router's split applies for free.
     `mode` selects single-pass, SSA-generational ('ssa'), self-consistency ('sc', `k` samples
-    merged by a φ majority-vote), or the compositional 'combined' arm (`k` lineages each refined
-    `r` rounds, then φ-merged). `combined` uses a PURE critic (no adaptive patching); the others
-    use the adaptive CheckerRole. GOAL/SCOUT stay mock (GSM8K emits no SCOUT)."""
+    merged by a φ majority-vote), or the compositional 'combined' arm (`k` ADAPTIVE lineages each
+    refined to its critic's satisfaction, then merged by a **verifier-weighted** φ over a dynamic
+    join). `critic_chat` (F2) runs the CHECKER on a separate — typically greedy — `chat` so only
+    the solvers are sampled; defaults to `chat`. GOAL/SCOUT stay mock (GSM8K emits no SCOUT)."""
     registry = default_registry()
-    registry[NodeType.ORCHESTRATOR] = GsmOrchestrator(mode=mode, k=k, r=r)
+    registry[NodeType.ORCHESTRATOR] = GsmOrchestrator(mode=mode, k=k)
     registry[NodeType.ENGINEER] = SolverRole(chat)
-    if mode == "combined":
-        registry[NodeType.REVIEWER] = CritiqueRole(chat)          # pure critic, pre-unrolled
-    else:
-        registry[NodeType.REVIEWER] = CheckerRole(chat, target_confidence=target_confidence,
-                                                  max_revision=max_revision)
+    registry[NodeType.REVIEWER] = CheckerRole(critic_chat or chat,
+                                              target_confidence=target_confidence,
+                                              max_revision=max_revision)
     registry[NodeType.SYNTHESIZER] = AnswerExecutor()
-    # φ-merge over the K competing (refined) solutions: majority-vote on final_answer, terminal.
-    registry[NodeType.PHI] = PhiExecutor(majority_vote("final_answer"),
-                                         signal=Signal.GOAL, kind="solution")
+    # combined => verifier-weighted merge (F1, uses the critics' confidence); sc => plain vote.
+    policy = confidence_weighted_vote("final_answer") if mode == "combined" \
+        else majority_vote("final_answer")
+    registry[NodeType.PHI] = PhiExecutor(policy, signal=Signal.GOAL, kind="solution")
     return registry
 
 

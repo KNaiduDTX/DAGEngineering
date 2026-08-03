@@ -58,6 +58,9 @@ class GraphProjection:
         # node_id -> {activity_key: recorded_result}; the replay cache that makes
         # nondeterministic executor sub-steps exactly-once (see activities.py).
         self.activities: dict[str, dict[str, Any]] = {}
+        # join_key -> {quorum, policy, contributors:[node_id], node_id:Optional} — dynamic
+        # fan-in points, materialized into a PHI node by the scheduler once quorum arrives.
+        self.joins: dict[str, dict] = {}
 
     # --------------------------------------------------------------------- #
     # Folding: apply(event) is the ONLY way the projection changes           #
@@ -94,6 +97,16 @@ class GraphProjection:
             # Cache a nondeterministic sub-step's result so a re-execution of this
             # node replays it instead of calling out again (see activities.py).
             self.activities.setdefault(e.node_id, {})[e.payload["key"]] = e.payload["result"]
+        elif t == EventType.JOIN_DECLARED:
+            p = e.payload
+            self.joins.setdefault(p["key"], {
+                "quorum": int(p["quorum"]), "policy": p.get("policy", "majority_vote"),
+                "contributors": [], "node_id": None})
+        elif t == EventType.JOIN_CONTRIBUTED:
+            p = e.payload
+            j = self.joins.get(p["key"])
+            if j is not None and p["contributor"] not in j["contributors"]:
+                j["contributors"].append(p["contributor"])
         elif t == EventType.GOAL_SATISFIED:
             self.terminal_node = e.node_id
         elif t == EventType.RUN_TERMINATED:
@@ -114,6 +127,9 @@ class GraphProjection:
         self.nodes[e.node_id] = rec
         self.out_edges.setdefault(e.node_id, set())
         self.in_edges.setdefault(e.node_id, set())
+        jk = p.get("join_key")                      # this node is a materialized join
+        if jk is not None and jk in self.joins:
+            self.joins[jk]["node_id"] = e.node_id
 
     def _apply_edge_created(self, e: Event) -> None:
         producer = e.payload["producer"]
@@ -164,6 +180,21 @@ class GraphProjection:
         if not parent_ids:
             return 0
         return max(self.nodes[p].generation for p in parent_ids) + 1
+
+    def ready_joins(self) -> list[str]:
+        """Declared joins whose quorum of contributions has arrived, whose contributors are all
+        COMPLETED, and which are not yet materialized. The scheduler creates a PHI node over the
+        contributors for each — deferred static fan-in (the join's generation is one above its
+        highest contributor, so monotonicity/acyclicity hold with no relaxation). Deterministic
+        order keeps the event sequence replay-stable."""
+        out = []
+        for key in sorted(self.joins):
+            j = self.joins[key]
+            if j["node_id"] is not None or len(j["contributors"]) < j["quorum"]:
+                continue
+            if all(self.nodes[c].state == NodeState.COMPLETED for c in j["contributors"]):
+                out.append(key)
+        return out
 
     # --------------------------------------------------------------------- #
     # Lineage / audit (the Neo4j-style queries)                              #

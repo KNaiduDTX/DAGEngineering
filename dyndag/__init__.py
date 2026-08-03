@@ -7,11 +7,12 @@ from .core import (NodeType, NodeState, Signal, Tier, TerminationReason,
                    Provenance, Event, EventType)
 from .store import SQLiteEventStore, EventStore
 from .graph import GraphProjection
-from .nodes import NodeSpec, SubgraphPatch
+from .nodes import NodeSpec, SubgraphPatch, JoinSpec
 from .activities import ActivityRecorder
 from .executors import (Executor, ExecutionResult, Context, ModelRouter,
                         MalformedResultError, TerminalExecutionError, default_registry)
-from .phi import PhiExecutor, argmax_score, majority_vote, union_covered
+from .phi import (PhiExecutor, argmax_score, majority_vote, confidence_weighted_vote,
+                  union_covered)
 from .roles import (EngineerRole, ReviewerRole, OrchestratorRole,
                     RetrievalScoutExecutor, chat_json_with_repair)
 from .executors_ollama import ollama_chat, ollama_registry
@@ -25,11 +26,11 @@ from .evaluation import (EvalTask, TaskResult, DEFAULT_TASKS, run_task, run_eval
                          cost_routing_report, savings_pct, accuracy, cost_per_correct,
                          gsm8k_report, mcnemar, paired_report, per_problem_rows)
 from .tasks_gsm8k import (gsm8k_registry, load_gsm8k, sample_tasks, SolverRole,
-                          CheckerRole, CritiqueRole, AnswerExecutor, GsmOrchestrator)
+                          CheckerRole, AnswerExecutor, GsmOrchestrator)
 
 __all__ = [
     "Scheduler", "RunResult", "SQLiteEventStore", "EventStore", "GraphProjection",
-    "NodeSpec", "SubgraphPatch", "Executor", "ExecutionResult", "Context",
+    "NodeSpec", "SubgraphPatch", "JoinSpec", "Executor", "ExecutionResult", "Context",
     "ActivityRecorder", "EngineerRole", "ReviewerRole", "OrchestratorRole",
     "RetrievalScoutExecutor", "chat_json_with_repair",
     "ollama_chat", "ollama_registry",
@@ -44,6 +45,6 @@ __all__ = [
     "cost_routing_report", "savings_pct", "accuracy", "cost_per_correct", "gsm8k_report",
     "mcnemar", "paired_report", "per_problem_rows",
     "gsm8k_registry", "load_gsm8k", "sample_tasks", "SolverRole", "CheckerRole",
-    "CritiqueRole", "AnswerExecutor", "GsmOrchestrator",
-    "PhiExecutor", "argmax_score", "majority_vote", "union_covered",
+    "AnswerExecutor", "GsmOrchestrator",
+    "PhiExecutor", "argmax_score", "majority_vote", "confidence_weighted_vote", "union_covered",
 ]

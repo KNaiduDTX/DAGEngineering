@@ -62,6 +62,28 @@ def majority_vote(key: str = "final_answer") -> MergePolicy:
     return _vote
 
 
+def confidence_weighted_vote(key: str = "final_answer") -> MergePolicy:
+    """Verifier-weighted self-consistency (the F1 merge): sum each candidate's score (its
+    critic's confidence) per answer value and pick the answer with the greatest TOTAL confidence
+    — consensus AND verification, not a blind headcount. A high-confidence lineage can outweigh
+    several low-confidence ones; unscored candidates contribute weight 1.0, so this degrades to
+    plain majority when no scores are present. Ties -> most votes, then lowest producer id."""
+    def _vote(candidates: list) -> tuple:
+        weight: dict = {}
+        votes: dict = {}
+        for _cid, out, score in candidates:
+            val = str(out.get(key))
+            weight[val] = weight.get(val, 0.0) + (score if score is not None else 1.0)
+            votes[val] = votes.get(val, 0) + 1
+        winner = max(weight, key=lambda v: (weight[v], votes[v]))
+        rep = next(c for c in candidates if str(c[1].get(key)) == winner)   # id-sorted first
+        basis = {"policy": "confidence_weighted_vote", "key": key,
+                 "weights": {k: round(w, 4) for k, w in weight.items()},
+                 "votes": votes, "winner": winner, "selected_from": rep[0]}
+        return rep[1], basis
+    return _vote
+
+
 def union_covered(candidates: list) -> tuple:
     """Combine (not select): union `covered` and merge `sections` across competing drafts,
     keeping the highest-scoring draft's other scalars. The brief task's fan-in merge."""

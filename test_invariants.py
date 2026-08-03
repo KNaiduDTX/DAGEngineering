@@ -850,6 +850,54 @@ def test_phi_fail_closed_on_empty_candidates():
         pass
 
 
+def test_dynamic_join_materializes_over_adaptive_depth():
+    """The dynamic-join substrate primitive (Design 1): two lineages of DIFFERENT depth contribute
+    to a declared join; the scheduler materializes it as a PHI node one generation above its
+    highest contributor (deferred static fan-in — acyclic, no monotonicity relaxation), and the
+    run replays identically. This is the on-the-fly fan-in the fixed pre-unroll couldn't express."""
+    from dyndag import PhiExecutor, majority_vote, AnswerGoal, JoinSpec
+
+    class _Orch(Executor):
+        def run(self, inputs, params, ctx):
+            a = NodeSpec(key="a", node_type=NodeType.ENGINEER, input_keys=(ctx.self_id,),
+                         params={"depth": 0, "join": "J", "lin": "a"})
+            b = NodeSpec(key="b", node_type=NodeType.ENGINEER, input_keys=(ctx.self_id,),
+                         params={"depth": 1, "join": "J", "lin": "b"})   # b refines once (deeper)
+            return ExecutionResult(output={}, signal=Signal.CONTINUE,
+                                   patch=SubgraphPatch(added_nodes=[a, b],
+                                                       declared_joins=[JoinSpec("J", 2)]))
+
+    class _Worker(Executor):
+        def run(self, inputs, params, ctx):
+            if params["depth"] == 0:                       # lineage terminal: contribute self
+                return ExecutionResult(
+                    output={"kind": "solution", "final_answer": "7", "score": 1.0},
+                    signal=Signal.CONTINUE,
+                    patch=SubgraphPatch(contributions=[(params["join"], ctx.self_id)]))
+            child = NodeSpec(key=f"{params['lin']}r", node_type=NodeType.ENGINEER,
+                             input_keys=(ctx.self_id,),
+                             params={"depth": params["depth"] - 1, "join": params["join"],
+                                     "lin": params["lin"]})
+            return ExecutionResult(output={"kind": "draft"}, signal=Signal.CONTINUE,
+                                   patch=SubgraphPatch(added_nodes=[child]))
+
+    reg = default_registry()
+    reg[NodeType.ORCHESTRATOR] = _Orch()
+    reg[NodeType.ENGINEER] = _Worker()
+    reg[NodeType.PHI] = PhiExecutor(majority_vote("final_answer"), signal=Signal.GOAL, kind="solution")
+    store = SQLiteEventStore(":memory:")
+    r = Scheduler(store, reg, budget=Budget(), goal_predicate=AnswerGoal()).run({"q": "x"})
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    j = r.graph.joins["J"]
+    assert j["node_id"] is not None and len(j["contributors"]) == 2, j
+    cgens = sorted(r.graph.nodes[c].generation for c in j["contributors"])
+    assert cgens[0] != cgens[1], f"lineages should be different depths: {cgens}"
+    join_gen = r.graph.nodes[j["node_id"]].generation
+    assert join_gen == max(cgens) + 1, (join_gen, cgens)   # deferred static fan-in, monotonic
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok, "replay diverged with a dynamic join"
+
+
 def test_gsm8k_self_consistency_beats_singlepass():
     """The third eval arm on GSM8K: one greedy solver is wrong, but the MAJORITY of K sampled
     solvers is right — single-pass fails, self-consistency (φ majority-vote) succeeds."""
@@ -870,8 +918,8 @@ def test_gsm8k_self_consistency_beats_singlepass():
 # --------------------------------------------------------------------------- #
 def _combined_chat(initials):
     """Fake `chat` for the combined arm: an initial solve returns the next preset answer; a
-    refinement (a critique is present) converges to '42'; the critic always asks to reconsider
-    (so every lineage gets refined)."""
+    refinement (a critique is present) converges to '42'; the critic APPROVES once the answer is
+    '42' and rejects otherwise — so lineages that started wrong refine (different depths)."""
     box = {"i": 0}
     def chat(messages, schema, name, required):
         payload = json.loads(messages[-1]["content"])
@@ -882,24 +930,28 @@ def _combined_chat(initials):
             a = initials[box["i"] % len(initials)]
             box["i"] += 1
             return {"content": {"reasoning": "first", "final_answer": str(a)}, "usage": u}
-        return {"content": {"verified": False, "confidence": 0.5, "critique": "reconsider"},
-                "usage": u}
+        ok = str(payload.get("final_answer")) == "42"           # verify: approve iff already 42
+        return {"content": {"verified": ok, "confidence": 1.0 if ok else 0.3,
+                            "critique": "" if ok else "recompute"}, "usage": u}
     return chat
 
 
 def test_gsm8k_combined_refines_then_merges():
-    """The compositional φ-of-SSA arm: K lineages, each refined (solver->critic->solver), then
-    φ-merged. Runs end-to-end, is terminal via the φ-node, has 2K solver nodes, replays clean."""
+    """The compositional φ-of-SSA arm (Design 1, on-the-fly): K ADAPTIVE lineages of possibly
+    different depth each refine to their critic's satisfaction, then contribute to a DYNAMIC
+    JOIN that materializes into a verifier-weighted φ. The join materializes over the K certified
+    answers, the run is terminal via that φ, and it replays clean."""
     from dyndag import gsm8k_registry, AnswerGoal
     store = SQLiteEventStore(":memory:")
-    reg = gsm8k_registry(_combined_chat(["1", "2", "42"]), mode="combined", k=3, r=1)
+    reg = gsm8k_registry(_combined_chat(["1", "2", "42"]), mode="combined", k=3)
     r = Scheduler(store, reg, budget=Budget(), goal_predicate=AnswerGoal()).run(
         {"question": "q", "problem_id": 0})
     assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
-    assert r.terminal_output.get("phi", {}).get("policy") == "majority_vote", r.terminal_output
+    assert r.terminal_output.get("phi", {}).get("policy") == "confidence_weighted_vote", r.terminal_output
     assert r.terminal_output["final_answer"] == "42", r.terminal_output
-    n_solver = sum(1 for rec in r.graph.nodes.values() if rec.node_type == NodeType.ENGINEER)
-    assert n_solver == 6, n_solver                        # 2K = 2 * 3 (one refinement each)
+    j = r.graph.joins.get("J")                             # the dynamic join materialized
+    assert j and j["node_id"] is not None and len(j["contributors"]) == 3, j
+    assert any(rec.node_type == NodeType.PHI for rec in r.graph.nodes.values()), "no PHI join node"
     ok, _, _ = verify_replay(store, r.graph, r.run_id)
     assert ok, "replay diverged with the combined arm"
 
@@ -914,8 +966,7 @@ def test_gsm8k_combined_beats_sc_when_refinement_helps():
                     goal_predicate=AnswerGoal())
     res = run_eval([task], {
         "sc": lambda: gsm8k_registry(_combined_chat(["1", "2", "42"]), mode="sc", k=3),
-        "combined": lambda: gsm8k_registry(_combined_chat(["1", "2", "42"]),
-                                           mode="combined", k=3, r=1),
+        "combined": lambda: gsm8k_registry(_combined_chat(["1", "2", "42"]), mode="combined", k=3),
     })
     assert res["sc"]["t"].success is False, "sc should tie to the wrong answer"
     assert res["combined"]["t"].success is True, "combined should refine to the right answer"

@@ -43,16 +43,36 @@ class NodeSpec:
 
 
 @dataclass
+class JoinSpec:
+    """A declared dynamic fan-in point (Layer 2/6). An expander that fans out K lineages of
+    UNKNOWN depth can't name their terminals in advance (their ids depend on how many times
+    each lineage refines), so it declares a join: a `key`, a `quorum` (how many contributions
+    to wait for), and the merge `policy` name. The scheduler MATERIALIZES it as a real PHI node
+    over the K contributor ids once quorum is met — deferred static fan-in, so generation
+    monotonicity and acyclicity are preserved (the join sits one generation above its highest
+    contributor). This is the substrate primitive for adaptive on-the-fly merging."""
+    key: str
+    quorum: int
+    policy: str = "majority_vote"         # a name PhiExecutor's registry entry understands
+
+
+@dataclass
 class SubgraphPatch:
     """The unit of on-the-fly construction. `added_nodes` is V+, `added_edges`
     is E+ (as logical (producer_key -> consumer_key) pairs). Edges are usually
     implied by input_keys; explicit edges are allowed for cross-links.
+
+    `declared_joins` registers dynamic fan-in points (JoinSpec); `contributions` binds a
+    (join_key, contributor_node_id) — a lineage's adaptively-produced result — to one. The
+    scheduler materializes each join as a PHI node once its quorum of contributions arrives.
 
     Invariant enforced downstream: every added node's generation is
     max(parent.generation)+1, which makes the graph generation-monotonic and
     therefore acyclic by construction (Layer 6)."""
     added_nodes: list[NodeSpec] = field(default_factory=list)
     added_edges: list[tuple[str, str]] = field(default_factory=list)
+    declared_joins: list["JoinSpec"] = field(default_factory=list)
+    contributions: list[tuple[str, str]] = field(default_factory=list)
 
     def edges(self) -> list[tuple[str, str]]:
         """All edges implied by the patch: explicit ones plus one per input_key."""
