@@ -999,6 +999,88 @@ def test_gsm8k_combined_beats_sc_when_refinement_helps():
     assert res["combined"]["t"].success is True, "combined should refine to the right answer"
 
 
+# --------------------------------------------------------------------------- #
+# combined_v2 — greedy-anchored, verify-gated, corroboration-select (no dilution) #
+# --------------------------------------------------------------------------- #
+def test_greedy_anchored_select_no_dilution_and_override():
+    """The merge-policy fix in isolation: DEFAULT to the greedy anchor; a noisy modal wrong answer
+    can't outvote it (no dilution), but a strongly-corroborated alternative still wins (upside)."""
+    from dyndag import greedy_anchored_select
+    A = lambda ans, score, anchor=False: ("id%d" % id((ans, score)),
+                                          {"final_answer": ans, **({"anchor": True} if anchor else {})}, score)
+    sel = greedy_anchored_select("final_answer", margin=1.0)
+    # greedy "42" correct; a modal-but-weak "17" (2 votes) must NOT override the anchor.
+    out, basis = sel([A("42", 1.0, anchor=True), A("17", 0.8), A("17", 0.8), A("3", 0.8)])
+    assert out["final_answer"] == "42", basis
+    # greedy "5" wrong; "12" corroborated by 3 independent derivations DOES override.
+    out2, _ = sel([A("5", 1.0, anchor=True), A("12", 0.9), A("12", 0.9), A("12", 0.9)])
+    assert out2["final_answer"] == "12"
+    # no anchor flag -> falls back to the id-sorted-first candidate (still deterministic).
+    out3, _ = sel([A("7", 1.0), A("7", 1.0)])
+    assert out3["final_answer"] == "7"
+
+
+def _v2_run(greedy_ans, indep_ans, indep_conf, explore_seq, k=5, margin=1.0):
+    """Run combined_v2 with separated mock chats: a greedy anchor solver, a temp explore solver
+    (preset sequence), and a greedy independent checker. max_revision=0 so exploratory lineages
+    contribute their raw first answer (isolates the MERGE from refinement)."""
+    from dyndag import gsm8k_registry, AnswerGoal
+    U = {"input_tokens": 1, "output_tokens": 1, "cost": 0.0}
+    def greedy_chat(messages, schema, name, required):
+        return {"content": {"reasoning": "g", "final_answer": str(greedy_ans)}, "usage": U}
+    box = {"i": 0}
+    def explore_chat(messages, schema, name, required):
+        a = explore_seq[box["i"] % len(explore_seq)]; box["i"] += 1
+        return {"content": {"reasoning": "e", "final_answer": str(a)}, "usage": U}
+    def check_chat(messages, schema, name, required):
+        return {"content": {"independent_answer": str(indep_ans), "confidence": indep_conf}, "usage": U}
+    reg = gsm8k_registry(greedy_chat, mode="combined_v2", k=k, critic_chat=check_chat,
+                         explore_chat=explore_chat, max_revision=0, margin=margin)
+    store = SQLiteEventStore(":memory:")
+    r = Scheduler(store, reg, budget=Budget(), goal_predicate=AnswerGoal()).run(
+        {"question": "Compute 1 plus 1.", "problem_id": 0})
+    return store, r
+
+
+def test_combined_v2_gate_returns_greedy_on_agreement():
+    """Verify-first GATE: when the greedy solver and the greedy independent check AGREE, combined_v2
+    returns that answer with NO exploration and NO φ-merge — it reduces to single-pass (cheap)."""
+    store, r = _v2_run(greedy_ans="42", indep_ans="42", indep_conf=1.0, explore_seq=["17"], k=5)
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    assert r.terminal_output["final_answer"] == "42", r.terminal_output
+    engineers = sum(1 for rec in r.graph.nodes.values() if rec.node_type == NodeType.ENGINEER)
+    assert engineers == 1, "gate agreement must not spawn exploratory solvers (found %d)" % engineers
+    assert not any(rec.node_type == NodeType.PHI for rec in r.graph.nodes.values()), "no merge on agreement"
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
+
+
+def test_combined_v2_no_dilution_keeps_greedy_on_scatter():
+    """No dilution: the greedy anchor is CORRECT ('42'); the check disagrees so exploration fires,
+    but the 4 temp samples scatter (modal '17' with only 2). A vote (sc/combined) would flip to
+    '17'; greedy_anchored_select KEEPS '42'. The φ materializes and the anchor wins."""
+    store, r = _v2_run(greedy_ans="42", indep_ans="99", indep_conf=0.8,
+                       explore_seq=["17", "17", "3", "9"], k=5)
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    assert r.terminal_output["phi"]["policy"] == "greedy_anchored_select", r.terminal_output
+    assert r.terminal_output["final_answer"] == "42", r.terminal_output["phi"]
+    j = r.graph.joins.get("J")
+    assert j and j["node_id"] is not None and len(j["contributors"]) == 5, j   # anchor + 4 explore
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok, "combined_v2 replay diverged"
+
+
+def test_combined_v2_overrides_greedy_on_strong_corroboration():
+    """Upside preserved: the greedy anchor is WRONG ('5'); exploration strongly corroborates '12'
+    (4 samples). greedy_anchored_select overrides the anchor and returns '12'."""
+    store, r = _v2_run(greedy_ans="5", indep_ans="12", indep_conf=0.9,
+                       explore_seq=["12", "12", "12", "12"], k=5)
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    assert r.terminal_output["final_answer"] == "12", r.terminal_output["phi"]
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
+
+
 def test_mcnemar_paired_and_domination():
     """The paired McNemar helper: counts discordant pairs, computes an exact p in (0,1], and
     flags strict domination when one policy's correct set contains the other's."""

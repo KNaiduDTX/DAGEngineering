@@ -25,7 +25,7 @@ from typing import Optional
 
 from .core import NodeType, Signal
 from .executors import default_registry
-from .phi import PhiExecutor, confidence_weighted_vote, majority_vote
+from .phi import (PhiExecutor, confidence_weighted_vote, greedy_anchored_select, majority_vote)
 from .roles import ChatJson
 from .steering import AnswerGoal
 from .tasks_gsm8k import AnswerExecutor, CheckerRole, GsmOrchestrator, SolverRole
@@ -237,18 +237,25 @@ MATH_CHECKER_SYS = (
 
 def math_registry(chat: ChatJson, mode: str = "ssa", k: int = 5,
                   critic_chat: Optional[ChatJson] = None,
-                  target_confidence: float = 0.9, max_revision: int = 3) -> dict:
+                  target_confidence: float = 0.9, max_revision: int = 3,
+                  explore_chat: Optional[ChatJson] = None, margin: float = 1.0) -> dict:
     """A registry (eval policy) for MATH — identical structure to gsm8k_registry, but MATH-framed
-    prompts and (crucially) a φ merge that votes on the NORMALIZED answer so equivalent LaTeX forms
-    aggregate. `mode`: single / ssa / sc / combined (adaptive φ-of-SSA via a dynamic join)."""
+    prompts and (crucially) a φ merge that operates on the NORMALIZED answer so equivalent LaTeX
+    forms aggregate. `mode`: single / ssa / sc / combined (φ-of-SSA vote) / combined_v2 (greedy
+    -anchored SELECT — never dilutes below single). `explore_chat` is the temp>0 chat for
+    combined_v2's exploratory lineages (its anchor stays on the greedy `chat`)."""
     registry = default_registry()
     registry[NodeType.ORCHESTRATOR] = GsmOrchestrator(mode=mode, k=k)
-    registry[NodeType.ENGINEER] = SolverRole(chat, system=MATH_SOLVER_SYS)
+    registry[NodeType.ENGINEER] = SolverRole(chat, system=MATH_SOLVER_SYS, explore_chat=explore_chat)
     registry[NodeType.REVIEWER] = CheckerRole(critic_chat or chat, target_confidence=target_confidence,
                                               max_revision=max_revision, system=MATH_CHECKER_SYS,
                                               equiv=is_equiv)
     registry[NodeType.SYNTHESIZER] = AnswerExecutor()
-    policy = (confidence_weighted_vote("final_answer", norm=_strip_string) if mode == "combined"
-              else majority_vote("final_answer", norm=_strip_string))
+    if mode == "combined_v2":
+        policy = greedy_anchored_select("final_answer", norm=_strip_string, margin=margin)
+    elif mode == "combined":
+        policy = confidence_weighted_vote("final_answer", norm=_strip_string)
+    else:
+        policy = majority_vote("final_answer", norm=_strip_string)
     registry[NodeType.PHI] = PhiExecutor(policy, signal=Signal.GOAL, kind="solution")
     return registry

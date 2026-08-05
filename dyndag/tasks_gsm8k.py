@@ -35,7 +35,7 @@ from typing import Optional
 from .core import NodeType, Signal
 from .executors import Executor, ExecutionResult, default_registry
 from .nodes import JoinSpec, NodeSpec, SubgraphPatch
-from .phi import PhiExecutor, confidence_weighted_vote, majority_vote
+from .phi import (PhiExecutor, confidence_weighted_vote, greedy_anchored_select, majority_vote)
 from .roles import ChatJson, _LlmRole
 from .schemas import SOLUTION_SCHEMA, VERIFY_SCHEMA
 from .steering import AnswerGoal
@@ -62,13 +62,17 @@ class SolverRole(_LlmRole):
     recorded activity, so a retry/replay reuses the same sample. `system` overrides the default
     (GSM8K) instruction — the seam a different task's registry uses to reframe the prompt."""
 
-    def __init__(self, chat: ChatJson, system: Optional[str] = None):
+    def __init__(self, chat: ChatJson, system: Optional[str] = None, explore_chat: Optional[ChatJson] = None):
         super().__init__(chat)
         self.system = system or _SOLVER_SYS
+        # A SEPARATE sampling chat (temp>0) for EXPLORATORY lineages (params["explore"]); the
+        # default `chat` stays greedy so the ANCHOR lineage is the deterministic single-pass solve.
+        self.explore_chat = explore_chat
 
     def run(self, inputs, params, ctx) -> ExecutionResult:
         revision = params.get("revision", 0)
         question = params["question"]
+        chat = self.explore_chat if (params.get("explore") and self.explore_chat is not None) else self.chat
         # Critique reaches a refinement either in params (the ADAPTIVE SSA path — the checker
         # knows it when it emits the refined solver) or in an input node (the pre-unrolled
         # combined path — a critic node produced it at runtime).
@@ -87,8 +91,8 @@ class SolverRole(_LlmRole):
                 "critique_to_address": critique})},
         ]
         recorded = ctx.record(f"solve_rev{revision}",
-                              lambda: self.chat(messages, SOLUTION_SCHEMA, "solution",
-                                                ("reasoning", "final_answer")))
+                              lambda: chat(messages, SOLUTION_SCHEMA, "solution",
+                                           ("reasoning", "final_answer")))
         data, usage = recorded["content"], recorded.get("usage")
         return ExecutionResult(output={
             "kind": "solution", "question": question, "revision": revision,
@@ -144,6 +148,44 @@ class CheckerRole(_LlmRole):
         independent = str(data.get("independent_answer", "")).strip()
         confidence = max(0.0, min(1.0, float(data.get("confidence", 0.0))))
         agree = bool(self.equiv(solver_answer, independent))
+
+        # VERIFY-FIRST GATE (the combined_v2 anchor lineage): compare the GREEDY solver answer to a
+        # GREEDY independent re-derivation. AGREE => return the greedy answer as-is (≡ single-pass:
+        # cheap, and no merge that could dilute it). DISAGREE (genuine uncertainty) => fan out K-1
+        # temp-sampled exploratory lineages into a dynamic join whose greedy-ANCHORED merge defaults
+        # to this greedy answer and overrides it only on strong independent corroboration.
+        if params.get("gate"):
+            k = max(1, int(params.get("k", 5)))
+            join_key = params.get("join", "J")
+            if agree:
+                answer = NodeSpec(key="answer", node_type=NodeType.SYNTHESIZER,
+                                  input_keys=(sol_id, ctx.self_id), params={})
+                return ExecutionResult(
+                    output={"verdict": "approve", "gate": "consensus", "agree": True,
+                            "independent_answer": independent, "confidence": round(confidence, 3)},
+                    signal=Signal.DONE, score=confidence, usage=usage,
+                    patch=SubgraphPatch(added_nodes=[answer]))
+            explore: list = []
+            for i in range(1, k):
+                s = NodeSpec(key=f"solver_{i}", node_type=NodeType.ENGINEER,
+                             input_keys=(ctx.self_id,),
+                             params={"question": question, "revision": 0, "sample": i,
+                                     "explore": True, "join": join_key, "lin": i})
+                c = NodeSpec(key=f"checker_{i}", node_type=NodeType.REVIEWER,
+                             input_keys=(f"solver_{i}",), params={"join": join_key, "lin": i})
+                explore += [s, c]
+            # This checker node IS the greedy ANCHOR contributor: it carries the single-pass answer
+            # flagged anchor=True with unit weight (one greedy derivation); the φ defaults to it.
+            anchor = {"kind": "solution", "question": question, "final_answer": solver_answer,
+                      "reasoning": solution.get("reasoning", ""), "anchor": True,
+                      "independent_answer": independent, "confidence": round(confidence, 3),
+                      "score": 1.0, "revision": revision}
+            return ExecutionResult(
+                output=anchor, signal=Signal.CONTINUE, score=1.0, usage=usage,
+                patch=SubgraphPatch(added_nodes=explore,
+                                    declared_joins=[JoinSpec(join_key, quorum=k,
+                                                             policy="greedy_anchored_select")],
+                                    contributions=[(join_key, ctx.self_id)]))
 
         # Approve when an INDEPENDENT solve agrees (and is confident), or when the revision cap is
         # hit (take the best-so-far answer so the lineage terminates rather than starving).
@@ -214,6 +256,8 @@ class GsmOrchestrator(Executor):
       ssa      => solver -> checker                   (the checker drives the ADAPTIVE SSA loop)
       sc       => solver_0..k-1 -> phi                (self-consistency: K samples, φ majority-vote)
       combined => [solver->critic->solver]_0..k-1 -> phi  (φ-of-SSA: K refined lineages, merged)
+      combined_v2 => greedy anchor + verify-first GATE; explore only on disagreement, then a
+                     greedy-ANCHORED φ (defaults to the single-pass answer, no dilution)
 
     `combined` is the compositional arm — refine EACH of K competing lines, THEN merge. Each
     lineage is a FIXED `r` rounds of solver->critic->refined-solver (statically unrolled,
@@ -222,9 +266,10 @@ class GsmOrchestrator(Executor):
     """
 
     def __init__(self, mode: str = "ssa", k: int = 5):
-        if mode not in ("single", "ssa", "sc", "combined"):
+        if mode not in ("single", "ssa", "sc", "combined", "combined_v2"):
             raise ValueError(
-                f"unknown GSM8K mode {mode!r} (expected 'single', 'ssa', 'sc' or 'combined')")
+                f"unknown GSM8K mode {mode!r} (expected 'single', 'ssa', 'sc', 'combined' "
+                f"or 'combined_v2')")
         self.mode = mode
         self.k = max(1, int(k))
 
@@ -267,6 +312,24 @@ class GsmOrchestrator(Executor):
                                     declared_joins=[JoinSpec("J", quorum=self.k,
                                                              policy="confidence_weighted_vote")]))
 
+        if self.mode == "combined_v2":
+            # Accuracy-preserving φ-of-SSA: a GREEDY ANCHOR lineage (solver_0 greedy -> checker_0
+            # with a VERIFY-FIRST GATE). The gate returns the greedy answer on agreement (≡ single
+            # on the consistent majority — no dilution, no exploration cost) and, only on genuine
+            # disagreement, fans out K-1 temp-sampled exploratory lineages into a dynamic join
+            # merged by greedy_anchored_select (defaults to the anchor; overrides only on strong
+            # independent corroboration). So `combined_v2` contains `single` as a special case and
+            # cannot dilute below it — the fix for the merge diluting the greedy signal.
+            solver0 = NodeSpec(key="solver_0", node_type=NodeType.ENGINEER,
+                               input_keys=(ctx.self_id,),
+                               params={"question": question, "revision": 0, "sample": 0})
+            checker0 = NodeSpec(key="checker_0", node_type=NodeType.REVIEWER,
+                                input_keys=("solver_0",),
+                                params={"gate": True, "k": self.k, "join": "J", "lin": 0})
+            return ExecutionResult(
+                output={"mode": "combined_v2", "plan": ["solver_0", "checker_0"]},
+                signal=Signal.CONTINUE, patch=SubgraphPatch(added_nodes=[solver0, checker0]))
+
         solver = NodeSpec(key="solver", node_type=NodeType.ENGINEER,
                           input_keys=(ctx.self_id,),
                           params={"question": question, "revision": 0})
@@ -286,7 +349,8 @@ class GsmOrchestrator(Executor):
 # --------------------------------------------------------------------------- #
 def gsm8k_registry(chat: ChatJson, mode: str = "ssa", k: int = 5,
                    critic_chat: Optional[ChatJson] = None,
-                   target_confidence: float = 0.9, max_revision: int = 3) -> dict:
+                   target_confidence: float = 0.9, max_revision: int = 3,
+                   explore_chat: Optional[ChatJson] = None, margin: float = 1.0) -> dict:
     """A registry (eval policy) for GSM8K over a provider-agnostic `chat`. SOLVER=ENGINEER
     (local tier), CHECKER=REVIEWER (cloud tier) — so the cost router's split applies for free.
     `mode` selects single-pass, SSA-generational ('ssa'), self-consistency ('sc', `k` samples
@@ -296,14 +360,19 @@ def gsm8k_registry(chat: ChatJson, mode: str = "ssa", k: int = 5,
     the solvers are sampled; defaults to `chat`. GOAL/SCOUT stay mock (GSM8K emits no SCOUT)."""
     registry = default_registry()
     registry[NodeType.ORCHESTRATOR] = GsmOrchestrator(mode=mode, k=k)
-    registry[NodeType.ENGINEER] = SolverRole(chat)
+    registry[NodeType.ENGINEER] = SolverRole(chat, explore_chat=explore_chat)
     registry[NodeType.REVIEWER] = CheckerRole(critic_chat or chat,
                                               target_confidence=target_confidence,
                                               max_revision=max_revision, equiv=_num_equiv)
     registry[NodeType.SYNTHESIZER] = AnswerExecutor()
-    # combined => verifier-weighted merge (F1, uses the critics' confidence); sc => plain vote.
-    policy = confidence_weighted_vote("final_answer") if mode == "combined" \
-        else majority_vote("final_answer")
+    # combined_v2 => greedy-anchored SELECT (no dilution below single); combined => verifier
+    # -weighted vote (F1); sc => plain majority vote.
+    if mode == "combined_v2":
+        policy = greedy_anchored_select("final_answer", margin=margin)
+    elif mode == "combined":
+        policy = confidence_weighted_vote("final_answer")
+    else:
+        policy = majority_vote("final_answer")
     registry[NodeType.PHI] = PhiExecutor(policy, signal=Signal.GOAL, kind="solution")
     return registry
 
