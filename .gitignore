@@ -13,3 +13,12 @@ venv/
 # Local scratch / event stores
 *.sqlite
 *.db
+
+# MATH / AIME benchmark data — user-downloaded / regenerated, never committed (see dyndag/tasks_math.py)
+math*.jsonl
+aime*.jsonl
+
+# Eval run artifacts — results, resumable checkpoints, run logs
+results*.json
+results*checkpoint*.jsonl
+*.log

@@ -67,15 +67,18 @@ SOLUTION_SCHEMA = {
     "required": ["reasoning", "final_answer"],
 }
 
-# CHECKER output: did the reasoning check out, how confident (0.0-1.0), and a one-line
-# critique to feed the next SSA revision. The checker never sees the gold answer — it judges
-# self-consistency of the reasoning, and `confidence` drives the approve/refine gate.
+# CHECKER output: an INDEPENDENT re-derivation of the answer. The checker re-solves the problem
+# from scratch — it never sees the gold answer, and (to avoid rubber-stamping its own work) is not
+# shown the solver's answer either — and reports its `independent_answer`, a `confidence` (0.0-1.0),
+# and an optional note. The scheduler compares this independent answer to the solver's IN CODE (via
+# an equivalence fn), so refinement triggers on genuine DISAGREEMENT — an objective signal — rather
+# than on the model's self-assessment of its own reasoning (which rubber-stamps confident errors).
 VERIFY_SCHEMA = {
     "type": "object",
     "properties": {
-        "verified": {"type": "boolean"},
+        "independent_answer": {"type": "string"},
         "confidence": {"type": "number"},
         "critique": {"type": "string"},
     },
-    "required": ["verified", "confidence", "critique"],
+    "required": ["independent_answer", "confidence"],
 }
