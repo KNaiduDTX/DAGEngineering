@@ -44,39 +44,49 @@ def argmax_score(candidates: list) -> tuple:
     return best[1], basis
 
 
-def majority_vote(key: str = "final_answer") -> MergePolicy:
+def majority_vote(key: str = "final_answer", norm=None) -> MergePolicy:
     """Self-consistency: choose the value of `key` that appears most often across candidates.
     Ties break to the tied value with the highest summed score, then (via id-sorted scan) the
-    lowest producer id. Returns a representative candidate's full output carrying the winner."""
-    def _vote(candidates: list) -> tuple:
-        counts = Counter(str(c[1].get(key)) for c in candidates)
+    lowest producer id. Returns a representative candidate's full output carrying the winner.
+    `norm` (optional) canonicalizes the value before counting, so equivalent-but-differently
+    -written answers (e.g. LaTeX `1/2` vs `\\frac{1}{2}`) aggregate instead of splitting the vote."""
+    _n = norm or (lambda x: x)
 
-        def _rank(val: str) -> tuple:
-            summed = sum((c[2] or 0.0) for c in candidates if str(c[1].get(key)) == val)
-            return counts[val], summed
+    def _vote(candidates: list) -> tuple:
+        def kv(c):
+            return _n(str(c[1].get(key)))
+        counts = Counter(kv(c) for c in candidates)
+
+        def _rank(val) -> tuple:
+            return counts[val], sum((c[2] or 0.0) for c in candidates if kv(c) == val)
         winner = max(counts, key=_rank)
-        rep = next(c for c in candidates if str(c[1].get(key)) == winner)   # id-sorted first
+        rep = next(c for c in candidates if kv(c) == winner)   # id-sorted first
         basis = {"policy": "majority_vote", "key": key, "votes": dict(counts),
                  "winner": winner, "selected_from": rep[0]}
         return rep[1], basis
     return _vote
 
 
-def confidence_weighted_vote(key: str = "final_answer") -> MergePolicy:
+def confidence_weighted_vote(key: str = "final_answer", norm=None) -> MergePolicy:
     """Verifier-weighted self-consistency (the F1 merge): sum each candidate's score (its
     critic's confidence) per answer value and pick the answer with the greatest TOTAL confidence
     — consensus AND verification, not a blind headcount. A high-confidence lineage can outweigh
     several low-confidence ones; unscored candidates contribute weight 1.0, so this degrades to
-    plain majority when no scores are present. Ties -> most votes, then lowest producer id."""
+    plain majority when no scores are present. Ties -> most votes, then lowest producer id.
+    `norm` canonicalizes the value before tallying (equivalent LaTeX forms aggregate)."""
+    _n = norm or (lambda x: x)
+
     def _vote(candidates: list) -> tuple:
+        def kv(c):
+            return _n(str(c[1].get(key)))
         weight: dict = {}
         votes: dict = {}
-        for _cid, out, score in candidates:
-            val = str(out.get(key))
-            weight[val] = weight.get(val, 0.0) + (score if score is not None else 1.0)
-            votes[val] = votes.get(val, 0) + 1
+        for c in candidates:
+            v = kv(c)
+            weight[v] = weight.get(v, 0.0) + (c[2] if c[2] is not None else 1.0)
+            votes[v] = votes.get(v, 0) + 1
         winner = max(weight, key=lambda v: (weight[v], votes[v]))
-        rep = next(c for c in candidates if str(c[1].get(key)) == winner)   # id-sorted first
+        rep = next(c for c in candidates if kv(c) == winner)   # id-sorted first
         basis = {"policy": "confidence_weighted_vote", "key": key,
                  "weights": {k: round(w, 4) for k, w in weight.items()},
                  "votes": votes, "winner": winner, "selected_from": rep[0]}

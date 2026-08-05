@@ -703,7 +703,8 @@ def _arith(q):
 def _gsm_chat(first_wrong=False):
     """A fake `chat` (the ChatJson seam): solves 'Compute A op B.' problems. With
     first_wrong, the first pass (no critique yet) returns a wrong answer and a refinement
-    returns the right one; the checker verifies against its OWN recomputation (never gold)."""
+    returns the right one; the checker RE-DERIVES independently from the problem alone (it is
+    never shown the solver's answer, never the gold) and the role compares the two in code."""
     def chat(messages, schema, name, required):
         payload = json.loads(messages[-1]["content"])
         if name == "solution":
@@ -712,10 +713,9 @@ def _gsm_chat(first_wrong=False):
             ans = str(correct + 1000) if wrong else str(correct)
             return {"content": {"reasoning": "work", "final_answer": ans},
                     "usage": {"input_tokens": 10, "output_tokens": 5, "cost": 0.001}}
-        fa = str(payload["final_answer"])                       # verify
-        ok = fa == str(_arith(payload["problem"]))
-        return {"content": {"verified": ok, "confidence": 1.0 if ok else 0.1,
-                            "critique": "" if ok else "recompute"},
+        # verify: an INDEPENDENT recomputation from the problem only (the answer is not shown)
+        return {"content": {"independent_answer": str(_arith(payload["problem"])),
+                            "confidence": 1.0, "critique": "recompute"},
                 "usage": {"input_tokens": 8, "output_tokens": 3, "cost": 0.002}}
     return chat
 
@@ -752,6 +752,33 @@ def test_gsm8k_ssa_helps_vs_singlepass():
     assert all(t.replay_ok for t in sp + ss), "replay-equivalence must hold during the eval"
     rep = gsm8k_report(results)
     assert "GSM8K EVAL" in rep and "$/correct" in rep, rep
+
+
+def test_checker_refines_on_independent_disagreement():
+    """The FIXED critic: it re-derives the answer INDEPENDENTLY (never shown the solver's answer,
+    never the gold) and refinement triggers on code-compared DISAGREEMENT — not on the model's
+    self-assessment — so a confidently-wrong solver is no longer rubber-stamped into approval.
+    A solver wrong on pass 1 disagrees with the independent re-derivation, takes an SSA g+1, and
+    is approved once it agrees. Replay holds."""
+    from dyndag import gsm8k_registry, AnswerGoal
+
+    def chat(messages, schema, name, required):
+        payload = json.loads(messages[-1]["content"])
+        u = {"input_tokens": 3, "output_tokens": 1, "cost": 0.0}
+        if name == "solution":
+            ans = "7" if payload.get("critique_to_address") else "999"    # wrong until refined
+            return {"content": {"reasoning": "r", "final_answer": ans}, "usage": u}
+        assert "final_answer" not in payload, "checker must NOT see the solver's answer (no anchoring)"
+        return {"content": {"independent_answer": "7", "confidence": 1.0}, "usage": u}
+
+    store = SQLiteEventStore(":memory:")
+    r = Scheduler(store, gsm8k_registry(chat, mode="ssa"), budget=Budget(),
+                  goal_predicate=AnswerGoal()).run({"question": "Compute 3 plus 4.", "problem_id": 0})
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    assert r.terminal_output["final_answer"] == "7", r.terminal_output       # refined to agreement
+    assert r.terminal_output.get("revision", 0) >= 1, "a disagreement must force at least one SSA revision"
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok
 
 
 def test_gsm8k_eval_metrics_surface():
@@ -794,7 +821,7 @@ def _sc_chat(answers):
             box["i"] += 1
             return {"content": {"reasoning": "r", "final_answer": str(a)},
                     "usage": {"input_tokens": 4, "output_tokens": 2, "cost": 0.001}}
-        return {"content": {"verified": True, "confidence": 1.0, "critique": ""},
+        return {"content": {"independent_answer": "0", "confidence": 1.0},   # sc has no checker
                 "usage": {"input_tokens": 2, "output_tokens": 1, "cost": 0.001}}
     return chat
 
@@ -930,9 +957,9 @@ def _combined_chat(initials):
             a = initials[box["i"] % len(initials)]
             box["i"] += 1
             return {"content": {"reasoning": "first", "final_answer": str(a)}, "usage": u}
-        ok = str(payload.get("final_answer")) == "42"           # verify: approve iff already 42
-        return {"content": {"verified": ok, "confidence": 1.0 if ok else 0.3,
-                            "critique": "" if ok else "recompute"}, "usage": u}
+        # verify: the INDEPENDENT re-derivation is always 42 (the mock's ground truth), so a
+        # lineage that started wrong disagrees and refines; one that started at 42 approves.
+        return {"content": {"independent_answer": "42", "confidence": 1.0}, "usage": u}
     return chat
 
 
@@ -985,6 +1012,35 @@ def test_mcnemar_paired_and_domination():
     assert (a_only, b_only) == (2, 0), (a_only, b_only)
     assert 0.0 < p <= 1.0, p
     assert "strictly dominates" in paired_report(results)
+
+
+def test_math_harness_grades_equivalent_latex():
+    """The MATH task end-to-end, offline: the combined arm (adaptive φ-of-SSA via a dynamic join)
+    solves a problem whose answer the model writes as one LaTeX form; the equivalence judge grades
+    it CORRECT against a differently-written gold, and WRONG against a different value. Replay holds.
+    Also checks the φ merge votes on the NORMALIZED answer (equivalent forms aggregate)."""
+    from dyndag import math_registry, AnswerGoal
+    from dyndag.tasks_math import _make_judge
+
+    forms = iter(["\\frac{1}{2}", "1/2", "\\dfrac{1}{2}"])   # 3 lineages, 3 equivalent forms
+
+    def chat(messages, schema, name, required):
+        u = {"input_tokens": 5, "output_tokens": 2, "cost": 0.0}
+        if name == "solution":
+            return {"content": {"reasoning": "w", "final_answer": next(forms)}, "usage": u}
+        # verify: independent answer 1/2 is is_equiv to every form -> each lineage approves at depth 1
+        return {"content": {"independent_answer": "\\frac{1}{2}", "confidence": 1.0}, "usage": u}
+
+    store = SQLiteEventStore(":memory:")
+    r = Scheduler(store, math_registry(chat, mode="combined", k=3), budget=Budget(),
+                  goal_predicate=AnswerGoal()).run({"question": "compute one half", "problem_id": 0})
+    assert r.reason == TerminationReason.GOAL_SATISFIED, r.reason
+    # φ voted over 3 equivalent LaTeX forms -> they aggregate to one winner (not a 1-1-1 tie).
+    assert max(r.terminal_output["phi"]["votes"].values()) == 3, r.terminal_output["phi"]["votes"]
+    assert _make_judge("1/2")(r), "equivalence judge should accept a 1/2 form for gold '1/2'"
+    assert not _make_judge("1/3")(r), "judge must reject a different value"
+    ok, _, _ = verify_replay(store, r.graph, r.run_id)
+    assert ok, "replay diverged on the MATH combined arm"
 
 
 def main():

@@ -7,7 +7,7 @@ predicate (steering.AnswerGoal) and a small role fleet over the SAME provider-ag
 `chat` seam the brief task uses (roles._LlmRole + ollama_chat / openrouter_chat):
 
   SOLVER   (bound to ENGINEER)     — reason step-by-step, emit a final answer
-  CHECKER  (bound to REVIEWER)     — verify the reasoning (NO gold answer), approve or steer
+  CHECKER  (bound to REVIEWER)     — re-derive independently (NO gold), approve on agreement or steer
   ANSWER   (bound to SYNTHESIZER)  — finalize the chosen solution, raise Signal.GOAL
 
 Reusing the existing node *types* means the cost router's local/cloud split (ENGINEER local,
@@ -44,10 +44,27 @@ from .steering import AnswerGoal
 # --------------------------------------------------------------------------- #
 # Roles (model-backed, over the abstract `chat`)                              #
 # --------------------------------------------------------------------------- #
+# Default system prompts (GSM8K). Injectable so a different task (e.g. MATH) can reframe the
+# instruction without duplicating the role logic — see tasks_math.py.
+_SOLVER_SYS = ("You are a careful math problem solver. Work through the problem step by step, "
+               "then state the final numeric answer. Put ONLY the number (no units, no words, "
+               "no thousands separators) in final_answer. Respond with JSON only.")
+_CHECKER_SYS = ("You are an independent verifier. Solve the given problem YOURSELF, from scratch, "
+                "with brief step-by-step reasoning — do NOT assume any prior attempt is correct. "
+                "Put ONLY your final number (no units, no words, no thousands separators) in "
+                "independent_answer, and your confidence from 0.0 to 1.0 that it is correct. "
+                "Respond with JSON only.")
+
+
 class SolverRole(_LlmRole):
     """Reason step-by-step and emit a final answer (bound to ENGINEER — generation). On a
     refinement it is fed the prior attempt + the checker's critique. The model call is a
-    recorded activity, so a retry/replay reuses the same sample."""
+    recorded activity, so a retry/replay reuses the same sample. `system` overrides the default
+    (GSM8K) instruction — the seam a different task's registry uses to reframe the prompt."""
+
+    def __init__(self, chat: ChatJson, system: Optional[str] = None):
+        super().__init__(chat)
+        self.system = system or _SOLVER_SYS
 
     def run(self, inputs, params, ctx) -> ExecutionResult:
         revision = params.get("revision", 0)
@@ -63,10 +80,7 @@ class SolverRole(_LlmRole):
         prior = next((v for v in inputs.values()
                       if isinstance(v, dict) and v.get("kind") == "solution"), None)
         messages = [
-            {"role": "system", "content": (
-                "You are a careful math problem solver. Work through the problem step by step, "
-                "then state the final numeric answer. Put ONLY the number (no units, no words, "
-                "no thousands separators) in final_answer. Respond with JSON only.")},
+            {"role": "system", "content": self.system},
             {"role": "user", "content": json.dumps({
                 "problem": question,
                 "prior_attempt": prior.get("final_answer") if prior else None,
@@ -84,20 +98,29 @@ class SolverRole(_LlmRole):
 
 
 class CheckerRole(_LlmRole):
-    """Verify the solver's reasoning (bound to REVIEWER — critique). It does NOT see the gold
-    answer; it judges self-consistency and reports confidence. Adaptive steering with two APPROVE
-    exits (verified-and-confident, or the revision cap reached):
+    """Verify the solver's answer by INDEPENDENT RE-DERIVATION (bound to REVIEWER — critique). It
+    never sees the gold answer, and — to avoid rubber-stamping its own work — it is NOT shown the
+    solver's answer either: it re-solves the problem from scratch, and the *code* compares the two
+    derivations via `equiv`. Refinement triggers on genuine DISAGREEMENT (an objective signal), not
+    on the model's self-assessment — the fix for the self-verification bias that let a same-model
+    'is this correct?' critic approve its own confident errors (so the SSA loop never fired). Two
+    APPROVE exits (independent agreement at/above `target_confidence`, or the revision cap — best
+    -so-far):
       * standalone SSA (no `join` in params) => emit the terminal ANSWER node (Signal.DONE);
       * a join lineage (combined arm)        => CONTRIBUTE this lineage's certified answer to the
-        dynamic join (Signal.CONTINUE), carrying its confidence as `score` so the φ can verifier
-        -weight it.
-    On REJECT it emits a refined solver (SSA g+1) fed the critique + a fresh checker, keyed
-    per-lineage (`lin`) so K lineages refine independently. Bounded by the revision cap + governor."""
+        dynamic join (Signal.CONTINUE), carrying its confidence as `score` for the verifier-weighted φ.
+    On REJECT it emits a refined solver (SSA g+1) fed a critique naming the discrepancy + a fresh
+    checker, keyed per-lineage (`lin`) so K lineages refine independently. Bounded by the cap + governor.
+    `equiv(solver_answer, independent_answer) -> bool` defaults to exact string match; a task passes
+    its grader's notion of equality (numeric for GSM8K, LaTeX-equivalence for MATH)."""
 
-    def __init__(self, chat: ChatJson, target_confidence: float = 0.9, max_revision: int = 3):
+    def __init__(self, chat: ChatJson, target_confidence: float = 0.9, max_revision: int = 3,
+                 system: Optional[str] = None, equiv=None):
         super().__init__(chat)
         self.target_confidence = target_confidence
         self.max_revision = max_revision
+        self.system = system or _CHECKER_SYS
+        self.equiv = equiv or (lambda a, b: str(a).strip() != "" and str(a).strip() == str(b).strip())
 
     def run(self, inputs, params, ctx) -> ExecutionResult:
         solution = next(v for v in inputs.values()
@@ -105,35 +128,32 @@ class CheckerRole(_LlmRole):
         sol_id = next(k for k, v in inputs.items() if v is solution)
         question = solution["question"]
         revision = solution.get("revision", 0)
+        solver_answer = solution.get("final_answer", "")
         join = params.get("join")                     # set => this lineage feeds a dynamic join
         lin = params.get("lin")                       # lineage index => per-lineage node keys
+        # INDEPENDENT re-derivation: the checker re-solves the PROBLEM ONLY — it is NOT shown the
+        # solver's answer (no anchoring) — then the code below compares the two derivations.
         messages = [
-            {"role": "system", "content": (
-                "You are a strict math checker. Decide whether the solution's reasoning is "
-                "correct and internally consistent for the problem. Return verified (bool), "
-                "your confidence from 0.0 to 1.0, and a one-line critique naming any error to "
-                "fix. Respond with JSON only.")},
-            {"role": "user", "content": json.dumps({
-                "problem": question, "reasoning": solution.get("reasoning", ""),
-                "final_answer": solution.get("final_answer", "")})},
+            {"role": "system", "content": self.system},
+            {"role": "user", "content": json.dumps({"problem": question})},
         ]
         recorded = ctx.record(f"check_{sol_id}",
                               lambda: self.chat(messages, VERIFY_SCHEMA, "verify",
-                                                ("verified", "confidence")))
+                                                ("independent_answer", "confidence")))
         data, usage = recorded["content"], recorded.get("usage")
-        verified = bool(data.get("verified"))
+        independent = str(data.get("independent_answer", "")).strip()
         confidence = max(0.0, min(1.0, float(data.get("confidence", 0.0))))
-        critique = str(data.get("critique", ""))
+        agree = bool(self.equiv(solver_answer, independent))
 
-        # Approve when the critic is satisfied, or when the revision cap is hit (take the
-        # best-so-far answer so the lineage terminates rather than starving).
-        if (verified and confidence >= self.target_confidence) or revision >= self.max_revision:
+        # Approve when an INDEPENDENT solve agrees (and is confident), or when the revision cap is
+        # hit (take the best-so-far answer so the lineage terminates rather than starving).
+        if (agree and confidence >= self.target_confidence) or revision >= self.max_revision:
             if join is not None:
                 # Certify this lineage's answer and CONTRIBUTE it to the join. This checker node
                 # is the contributor: it carries the answer + its confidence as `score`, which the
                 # verifier-weighted φ uses to weight the merge.
                 certified = {"kind": "solution", "question": question,
-                             "final_answer": solution.get("final_answer", ""),
+                             "final_answer": solver_answer,
                              "reasoning": solution.get("reasoning", ""),
                              "confidence": round(confidence, 3), "score": round(confidence, 3),
                              "revision": revision}
@@ -143,11 +163,17 @@ class CheckerRole(_LlmRole):
             answer = NodeSpec(key="answer", node_type=NodeType.SYNTHESIZER,
                               input_keys=(sol_id, ctx.self_id), params={})
             return ExecutionResult(
-                output={"verdict": "approve", "verified": verified,
-                        "confidence": round(confidence, 3)},
+                output={"verdict": "approve", "agree": agree,
+                        "independent_answer": independent, "confidence": round(confidence, 3)},
                 signal=Signal.DONE, score=confidence, usage=usage,
                 patch=SubgraphPatch(added_nodes=[answer]))
 
+        # REJECT: the two independent derivations disagree -> refine, feeding a CONCRETE critique
+        # naming the discrepancy (this is what makes the refinement targeted rather than blind).
+        note = str(data.get("critique", "")).strip()
+        critique = (f"Your final answer was {solver_answer!r}, but an independent solution gives "
+                    f"{independent!r}. At least one derivation has an error — recheck each step and "
+                    f"resolve the discrepancy." + (f" Hint: {note}" if note else ""))
         skey = "solver" if lin is None else f"solver_{lin}"
         ckey = "checker" if lin is None else f"checker_{lin}"
         refined = NodeSpec(key=skey, node_type=NodeType.ENGINEER,
@@ -157,8 +183,9 @@ class CheckerRole(_LlmRole):
         re_check = NodeSpec(key=ckey, node_type=NodeType.REVIEWER,
                             input_keys=(skey,), params={"join": join, "lin": lin})
         return ExecutionResult(
-            output={"verdict": "reject", "verified": verified,
-                    "confidence": round(confidence, 3), "critique": critique},
+            output={"verdict": "reject", "agree": agree,
+                    "independent_answer": independent, "confidence": round(confidence, 3),
+                    "critique": critique},
             signal=Signal.NEEDS_REFINEMENT, score=confidence, usage=usage,
             patch=SubgraphPatch(added_nodes=[refined, re_check]))
 
@@ -272,7 +299,7 @@ def gsm8k_registry(chat: ChatJson, mode: str = "ssa", k: int = 5,
     registry[NodeType.ENGINEER] = SolverRole(chat)
     registry[NodeType.REVIEWER] = CheckerRole(critic_chat or chat,
                                               target_confidence=target_confidence,
-                                              max_revision=max_revision)
+                                              max_revision=max_revision, equiv=_num_equiv)
     registry[NodeType.SYNTHESIZER] = AnswerExecutor()
     # combined => verifier-weighted merge (F1, uses the critics' confidence); sc => plain vote.
     policy = confidence_weighted_vote("final_answer") if mode == "combined" \
@@ -300,6 +327,14 @@ def _last_number(s) -> str:
     if re.fullmatch(r"-?\d+\.0+", t):
         t = t.split(".")[0]
     return t
+
+
+def _num_equiv(a, b) -> bool:
+    """Agreement between two answers on the normalized final number — the SAME extraction the
+    eval judge uses — so the checker's independent re-derivation is compared to the solver's the
+    way the grader would. Two blank answers do NOT count as agreement (nothing was derived)."""
+    na, nb = _last_number(a), _last_number(b)
+    return na != "" and na == nb
 
 
 def _extract_pred(terminal_output) -> str:
