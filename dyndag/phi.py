@@ -94,6 +94,42 @@ def confidence_weighted_vote(key: str = "final_answer", norm=None) -> MergePolic
     return _vote
 
 
+def greedy_anchored_select(key: str = "final_answer", norm=None, margin: float = 1.0) -> MergePolicy:
+    """Accuracy-preserving merge for the compositional arm (combined_v2) — the fix for merge
+    DILUTION. Unlike a vote, this DEFAULTS to the greedy ANCHOR candidate (the temp=0 single-pass
+    answer, flagged `output["anchor"]=True`) and overrides it ONLY when some alternative answer's
+    INDEPENDENT corroboration — the summed verifier confidence (score) of every candidate producing
+    it — exceeds the anchor's by `margin`. So noisy temperature samples can never outvote the greedy
+    answer (combined never dilutes below single-pass), yet a genuinely better-corroborated answer
+    still wins (the upside is preserved, gated on real evidence). `norm` canonicalizes values before
+    tallying (equivalent LaTeX forms aggregate); with no anchor flag it falls back to the id-sorted
+    -first candidate. Pure & deterministic ⇒ replay-stable, like every merge policy here."""
+    _n = norm or (lambda x: x)
+
+    def _sel(candidates: list) -> tuple:
+        def kv(c):
+            return _n(str(c[1].get(key)))
+        anchor = next((c for c in candidates if isinstance(c[1], dict) and c[1].get("anchor")),
+                      candidates[0])
+        gval = kv(anchor)
+        corrob: dict = {}
+        reps: dict = {}
+        for c in candidates:
+            v = kv(c)
+            corrob[v] = corrob.get(v, 0.0) + (c[2] if c[2] is not None else 1.0)
+            reps.setdefault(v, c)                              # id-sorted first as representative
+        best_alt = max(corrob, key=lambda v: corrob[v])
+        if best_alt != gval and corrob[best_alt] > corrob[gval] + margin:
+            winner, rep = best_alt, reps[best_alt]            # strong independent evidence overrides
+        else:
+            winner, rep = gval, anchor                        # default: keep the greedy anchor
+        basis = {"policy": "greedy_anchored_select", "key": key, "anchor": gval,
+                 "corroboration": {k: round(w, 4) for k, w in corrob.items()},
+                 "margin": margin, "winner": winner, "selected_from": rep[0]}
+        return rep[1], basis
+    return _sel
+
+
 def union_covered(candidates: list) -> tuple:
     """Combine (not select): union `covered` and merge `sections` across competing drafts,
     keeping the highest-scoring draft's other scalars. The brief task's fan-in merge."""

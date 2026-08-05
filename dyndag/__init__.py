@@ -12,7 +12,7 @@ from .activities import ActivityRecorder
 from .executors import (Executor, ExecutionResult, Context, ModelRouter,
                         MalformedResultError, TerminalExecutionError, default_registry)
 from .phi import (PhiExecutor, argmax_score, majority_vote, confidence_weighted_vote,
-                  union_covered)
+                  greedy_anchored_select, union_covered)
 from .roles import (EngineerRole, ReviewerRole, OrchestratorRole,
                     RetrievalScoutExecutor, chat_json_with_repair)
 from .executors_ollama import ollama_chat, ollama_registry
@@ -48,5 +48,6 @@ __all__ = [
     "math_registry", "load_math", "is_equiv",
     "gsm8k_registry", "load_gsm8k", "sample_tasks", "SolverRole", "CheckerRole",
     "AnswerExecutor", "GsmOrchestrator",
-    "PhiExecutor", "argmax_score", "majority_vote", "confidence_weighted_vote", "union_covered",
+    "PhiExecutor", "argmax_score", "majority_vote", "confidence_weighted_vote",
+    "greedy_anchored_select", "union_covered",
 ]
