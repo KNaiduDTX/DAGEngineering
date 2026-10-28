@@ -5,7 +5,8 @@ algorithms. The `dyndag/` package is its reference implementation; every clause
 below points at the module that discharges it. Where the PoC narrows a
 production choice (SQLite for Postgres, deterministic executors for models,
 serial batches for concurrency), the narrowing is stated and §9 gives the
-production form.
+production form — several of which (the real executor fleet, full concurrency, and
+the benchmark eval stack) are now realized and marked *Done* there.
 
 **Approved decisions this spec is bound to**
 
@@ -110,12 +111,14 @@ Module: `graph.GraphProjection.ready_set`.
 | `NODE_CREATED` | `node_type, input_ids, params, provenance` | fact + guard |
 | `EDGE_CREATED` | `producer, consumer, provenance` | fact + guard |
 | `NODE_STARTED` | `tier, model, cost` | dispatch + cost, stamps `started_at` |
-| `NODE_COMPLETED` | `output, score, signal` | single-assignment write |
+| `NODE_COMPLETED` | `output, score, signal, usage, cost_usd` | single-assignment write |
 | `NODE_FAILED` | `error, attempt` | retry accounting |
 | `NODE_REOPENED` | `attempt` | returns a FAILED node to the frontier as a *logged fact*, not a state mutation |
 | `ACTIVITY_RECORDED` | `key, result` | a nondeterministic sub-step's result, recorded for replay / exactly-once |
 | `SUBGRAPH_EMITTED` | `added_nodes` | lineage of construction |
 | `NODE_PRUNED` | `key, reason, expander_id` | constraint-filter audit |
+| `JOIN_DECLARED` | `key, quorum, policy` | a dynamic fan-in point, materialized into a PHI node once quorum arrives (§9) |
+| `JOIN_CONTRIBUTED` | `key, contributor` | one lineage bound its (adaptively-produced) result to a join (§9) |
 | `GOAL_SATISFIED` | `output` | terminal acceptance |
 | `RUN_TERMINATED` | `reason` | one of four reasons (§7) |
 
@@ -133,16 +136,21 @@ edges on the fly, computed as downstream variables of prior nodes."
 ### 2.1 Patch contract
 
 ```
-SubgraphPatch = (added_nodes : [NodeSpec], added_edges : [(key, key)])
+SubgraphPatch = (added_nodes : [NodeSpec], added_edges : [(key, key)],
+                 declared_joins : [JoinSpec], contributions : [(join_key, contributor_id)])
 NodeSpec      = (key, node_type, input_keys, params)
+JoinSpec      = (key, quorum, policy)      # a declared dynamic fan-in point (§6, §9)
 ```
 
 `input_keys` reference either a **concrete existing node id** (e.g. the expander
 referencing itself via `ctx.self_id`, or a prior draft) or a **logical key of a
 sibling** in the same patch. Edges are the union of `added_edges` and one edge
-per `input_key`.
+per `input_key`. A patch may additionally **declare dynamic fan-in points** and
+**bind contributions** to them (`declared_joins` / `contributions`) — the
+adaptive-merge machinery specified in §9, materialized by the scheduler once a
+join's quorum of contributions arrives.
 
-Module: `nodes.SubgraphPatch`, `nodes.NodeSpec`.
+Module: `nodes.SubgraphPatch`, `nodes.NodeSpec`, `nodes.JoinSpec`.
 
 ### 2.2 Apply algorithm (`scheduler._apply_patch`)
 
@@ -219,7 +227,8 @@ Aggregation (`SynthesizerExecutor`, in-degree > 1) merges convergent branches to
 a single terminal output. When the branches are *competing* definitions of the same
 result (K sampled solutions, or two refinement lineages) rather than complementary
 parts, a **φ-node** (`phi.PhiExecutor`) is the merge with an explicit selection rule —
-argmax-score, majority-vote, or union — recording which branch won (§6, §9).
+argmax-score, majority-vote, confidence-weighted (verifier-weighted) vote,
+greedy-anchored select, or union — recording which branch won (§6, §9).
 
 Modules: `steering.beam_prune`, `executors.SynthesizerExecutor`, `phi.PhiExecutor`.
 
@@ -231,7 +240,7 @@ Modules: `steering.beam_prune`, `executors.SynthesizerExecutor`, `phi.PhiExecuto
 
 ```
 Executor.run(inputs: {producer_id: output}, params: dict, ctx: Context)
-        -> ExecutionResult(output, signal, score?, patch?)
+        -> ExecutionResult(output, signal, score?, patch?, usage?)
 ```
 
 `signal` is a **typed** value (`CONTINUE/DONE/NEEDS_REFINEMENT/GOAL`), never a
@@ -259,6 +268,7 @@ Module: `executors.Executor`, `executors.ExecutionResult`,
 | `ENGINEER` | generation / refinement |
 | `REVIEWER` | critic — the error signal (§3.1) |
 | `SYNTHESIZER` | aggregator — convergence |
+| `PHI` | φ-merge — selects/combines competing branches, records the selector (§3.4, §9) |
 | `TESTER/HARDENER/OPS/MAINTAINER/DEBUGGER` | critic/terminal variants, same contract |
 
 A **complex agent is a nested subgraph**: its executor returns a `SubgraphPatch`
@@ -329,6 +339,7 @@ Module: `executors.ModelRouter`.
 seed GOAL(g0) and ORCHESTRATOR(g1)
 loop:
     if governor.check(): terminate(reason)
+    materialize_joins()                        # quorum-met dynamic joins -> PHI nodes (§9)
     frontier = ready_set()                     # the parallel batch
     if frontier == ∅: terminate(NO_PROGRESS)   # deadlock/starvation guard
     frontier = beam_prune(frontier)            # optional
@@ -426,6 +437,9 @@ Module: `governor.CostGovernor`, `scheduler.run`.
 | φ-merge selects/combines competing branches; pure ⇒ replay-stable; fail-closed (§6, §9) | `test_phi_argmax_selects_top_score`; `test_phi_majority_vote_self_consistency`; `test_phi_merge_replays_identically`; `test_phi_fail_closed_on_empty_candidates`; `test_gsm8k_self_consistency_beats_singlepass` |
 | dynamic JOIN materializes over adaptive-depth lineages; acyclic + replay-stable (§6, §9) | `test_dynamic_join_materializes_over_adaptive_depth` |
 | combined φ-of-SSA arm (adaptive refine + verifier-weighted merge); paired McNemar (§9) | `test_gsm8k_combined_refines_then_merges`; `test_gsm8k_combined_beats_sc_when_refinement_helps`; `test_mcnemar_paired_and_domination` |
+| CHECKER is an independent re-derivation; refines on disagreement, not self-assessment (§9) | `test_checker_refines_on_independent_disagreement` |
+| `combined_v2`: greedy-anchored merge never dilutes below single, overrides on corroboration (§9) | `test_greedy_anchored_select_no_dilution_and_override`; `test_combined_v2_gate_returns_greedy_on_agreement`; `test_combined_v2_no_dilution_keeps_greedy_on_scatter`; `test_combined_v2_overrides_greedy_on_strong_corroboration` |
+| MATH/AIME LaTeX-equivalence grading; φ votes on the normalized answer (§9) | `test_math_harness_grades_equivalent_latex` |
 | SSA write-once | `test_single_assignment_write_once` |
 
 Run `python demo.py` and `python test_invariants.py`; both assert these.
@@ -478,15 +492,21 @@ What changes, and nothing else does:
   validate/repair land on the fail-closed guard (INV-4.2). GOAL/SYNTHESIZER stay mock.
   Run `python demo_ollama.py` (local) or `python eval_cost_routing.py` (cost routing).
 * **Standard-benchmark eval (GSM8K)** — the substrate pointed at grade-school math
-  (`tasks_gsm8k`): SOLVER/CHECKER/ANSWER roles over the same `chat`, run under four
+  (`tasks_gsm8k`): SOLVER/CHECKER/ANSWER roles over the same `chat`, run under **five**
   configurations that ablate the two construction primitives —
-  **single-pass** (neither), **SSA-generational** (refinement only — a CHECKER drives it, each
-  retry a new generation), **self-consistency** (merge only — K sampled solvers → a **φ-node**
-  majority-vote), and **combined / φ-of-SSA** (both — K **adaptive** lineages, each refined to
-  its own critic's satisfaction, then merged by a **verifier-weighted** φ over a **dynamic
-  join**), the arm that tests the *compositional* claim. The harness reports the paper's five
-  numbers — accuracy, **$ per correct answer** (the cost/quality frontier), mean generations,
-  wall-clock under concurrency, and replay-equivalence holding live during the eval (even under
+  **single-pass** (neither), **SSA-generational** (refinement only, each retry a new
+  generation), **self-consistency** (merge only — K sampled solvers → a **φ-node**
+  majority-vote), **combined / φ-of-SSA** (both — K **adaptive** lineages, each refined to its
+  own critic's satisfaction, then merged by a **verifier-weighted** φ over a **dynamic join**),
+  and **`combined_v2`** (the accuracy-preserving compositional arm — next bullet). The
+  **CHECKER is an independent re-derivation, not a self-assessment**: it re-solves the problem
+  from scratch, is shown neither the gold answer nor the solver's answer (to avoid anchoring on
+  its own work), and the *code* compares the two derivations via an equivalence fn — so
+  refinement fires on genuine **disagreement** (an objective signal), the fix for the
+  self-verification bias that let a same-model "is this correct?" critic rubber-stamp its own
+  confident errors (so the SSA loop never fired). The harness reports the paper's five numbers —
+  accuracy, **$ per correct answer** (the cost/quality frontier), mean generations, wall-clock
+  under concurrency, and replay-equivalence holding live during the eval (even under
   temperature-sampled self-consistency and the adaptive join, because every sample is a recorded
   activity) — plus a **paired McNemar** analysis over the *shared* task set (the right test when
   every policy runs the same problems, and the only way to see strict domination or that a small
@@ -494,6 +514,29 @@ What changes, and nothing else does:
   number; the goal predicate (`AnswerGoal`) only certifies an answer was produced, so the DAG
   never sees the gold label. Run
   `python eval_gsm8k.py --data test.jsonl --configs single,ssa,sc,combined --dump p.json`.
+* **`combined_v2` — the dilution-safe compositional arm (`phi.greedy_anchored_select`).** Plain
+  `combined` can *dilute* a correct greedy answer when noisy temperature samples outvote it.
+  `combined_v2` fixes that with a **verify-first gate**: a greedy anchor lineage (greedy solver
+  → checker) runs first; on **agreement** it returns the greedy answer as-is (≡ single-pass —
+  cheap, with no merge that could dilute it); only on **disagreement** does it fan out K−1
+  temperature-sampled exploratory lineages into a dynamic join whose **greedy-anchored** merge
+  defaults to the anchor and overrides it **only** when some alternative answer's summed
+  independent corroboration beats the anchor's by `margin`. So `combined_v2` contains `single` as
+  a special case and **cannot dilute below it**, while a genuinely better-corroborated answer
+  still wins. It is driven through `run_eval_parallel.py` (`eval_gsm8k.py` exposes
+  `single,ssa,sc,combined`).
+* **Competition-math eval (MATH / AIME) — grading by equivalence (`tasks_math`).** MATH/AIME
+  answers are LaTeX (`\frac`, `\sqrt`, tuples, degrees), so grading is **equivalence, not exact
+  match**: a port of the canonical Hendrycks `is_equiv` normalization (fraction / sqrt / unit /
+  spacing canonicalization, plus a numeric fallback for pure decimals) + `\boxed{}` extraction.
+  The **same role fleet and all five arms are reused verbatim** — only the solver/checker prompts
+  and the judge differ — and the φ merge votes on the **normalized** answer so equivalent LaTeX
+  forms aggregate rather than splitting the vote. The loader reads `{problem, answer, level,
+  subject}` JSONL with a `min_level` difficulty filter (1–5); AIME is handled as MATH-format
+  JSONL. `run_eval_parallel.py` overlaps every (config, task) run in a flat thread pool,
+  **checkpoints** each completed run to JSONL, **resumes** from the checkpoint on restart
+  (surviving a kill), and retries errored runs. Run
+  `python run_eval_parallel.py --task math --data math500.jsonl --configs single,combined_v2 --margin 1.0`.
 * **On-the-fly dynamic fan-in — the JOIN primitive (`JoinSpec`, `graph.joins`, `scheduler.
   _materialize_joins`).** Static fan-out (K known solvers) can be φ-merged directly, but ADAPTIVE
   fan-out cannot: when K lineages refine to *data-dependent* depth, their terminal ids are
@@ -511,7 +554,9 @@ What changes, and nothing else does:
   rule — the SSA φ-function made concrete. Competing branches (K solver samples, or two
   refinement lineages) fan into a `PhiExecutor` that applies a merge policy — **argmax-score**
   (best-of-N), **majority-vote** (self-consistency), **confidence-weighted vote** (verifier
-  -weighted — consensus scaled by the critics' confidence), or **union** (combine) — and records
+  -weighted — consensus scaled by the critics' confidence), **greedy-anchored select** (defaults
+  to the greedy anchor, overriding only on strong independent corroboration — the no-dilution
+  merge for `combined_v2`), or **union** (combine) — and records
   the selector (which branch won, and the tally) on its output for lineage. The merge is a pure,
   id-sorted, deterministic fold, so the graph stays replay-identical (INV-5.2); empty input is
   fail-closed (INV-4.2).
@@ -542,11 +587,12 @@ What changes, and nothing else does:
 | `roles.py` | §3.1, §4.1, §5.2–5.3, §9 (**single source** of the model-backed ENGINEER/REVIEWER/ORCHESTRATOR logic + prompts + the shared validate→repair loop, over an abstract `chat`; real retrieval SCOUT) |
 | `executors_ollama.py` | §3.1, §5.2 (native-Ollama `chat` — `format=` structured transport + registry; injectable call, offline-testable) |
 | `executors_openrouter.py` | §4.1, §5.2–5.3, §9 (OpenAI-compatible `chat` — raw-urllib transport + refusal/cost extract + registry; `max_retries=0` by construction; injectable transport) |
-| `phi.py` | §6, §9 (φ-nodes: merge COMPETING branches — argmax-score / majority-vote / confidence-weighted / union; `PhiExecutor` records the selector; pure ⇒ replay-stable, fail-closed) |
-| `tasks_gsm8k.py` | §9 (GSM8K as a DAG task: SOLVER / CHECKER / ANSWER roles + orchestrator over `chat`; single-pass / SSA / self-consistency / **combined (adaptive φ-of-SSA via a dynamic join)** registries; JSONL loader + exact-match judge) |
+| `phi.py` | §6, §9 (φ-nodes: merge COMPETING branches — argmax-score / majority-vote / confidence-weighted / greedy-anchored / union; `PhiExecutor` records the selector; pure ⇒ replay-stable, fail-closed) |
+| `tasks_gsm8k.py` | §9 (GSM8K as a DAG task: SOLVER / CHECKER (independent re-derivation) / ANSWER roles + orchestrator over `chat`; single-pass / SSA / self-consistency / **combined (adaptive φ-of-SSA via a dynamic join)** / **`combined_v2` (greedy-anchored, verify-gated — no dilution below single)** registries; JSONL loader + exact-match judge) |
+| `tasks_math.py` | §9 (MATH/AIME as a DAG task: the same role fleet + all five arms, a ported Hendrycks `is_equiv` LaTeX-equivalence grader + `\boxed{}` extraction, `min_level` filter; the φ votes on the normalized answer) |
 | `evaluation.py` | §9 (eval harness: policies, run_eval; cost-routing report, GSM8K report — accuracy, $/correct, generations, wall-clock, replay — and **paired McNemar** analysis over the shared task set) |
 | `steering.py` | §3.2–3.4 (**pluggable** goal predicate — `GoalPredicate` protocol, `CoverageGoal` / `AnswerGoal`; filter, beam, value) |
 | `governor.py` | §7 (bounds, retry budget) |
 | `scheduler.py` | §2.2, §5.4 (the loop; injectable goal predicate; `_materialize_joins` — deferred static fan-in for dynamic joins) |
 | `views.py` | §4.3, §5.2, §8 (blackboard, replay, lineage, cost report) |
-| `demo.py`, `demo_ollama.py`, `eval_cost_routing.py`, `eval_gsm8k.py`, `test_invariants.py` | §8, §9 (executable proofs + live demos) |
+| `demo.py`, `demo_ollama.py`, `eval_cost_routing.py`, `eval_gsm8k.py`, `run_eval_parallel.py`, `test_invariants.py` | §8, §9 (executable proofs + live demos; `run_eval_parallel.py` is the parallel, checkpointed, resumable GSM8K + MATH/AIME runner) |
